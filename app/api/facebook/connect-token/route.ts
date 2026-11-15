@@ -6,6 +6,7 @@ import {
   listFacebookPagesForToken,
   type DiscoverableFacebookPage,
 } from "@/lib/meta/facebook-pages";
+import { requireSettingsUnlock } from "@/lib/settings-access";
 import {
   canManageWorkspace,
   getCurrentWorkspaceContext,
@@ -21,6 +22,9 @@ export async function POST(request: NextRequest) {
   if (!session?.user?.id) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
+
+  const locked = await requireSettingsUnlock();
+  if (locked) return locked;
 
   const context = await getCurrentWorkspaceContext();
   if (!context || !canManageWorkspace(context.role)) {

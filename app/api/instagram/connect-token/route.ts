@@ -8,6 +8,7 @@ import {
   subscribeInstagramAccountToWebhooks,
 } from "@/lib/meta/client";
 import { encryptToken } from "@/lib/meta/oauth";
+import { requireSettingsUnlock } from "@/lib/settings-access";
 import { canManageWorkspace, getCurrentWorkspaceContext } from "@/lib/workspace-access";
 
 type DiscoveredAccount = {
@@ -97,6 +98,9 @@ export async function POST(request: NextRequest) {
   if (!session?.user?.id) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
+
+  const locked = await requireSettingsUnlock();
+  if (locked) return locked;
 
   const context = await getCurrentWorkspaceContext();
   if (!context || !canManageWorkspace(context.role)) {

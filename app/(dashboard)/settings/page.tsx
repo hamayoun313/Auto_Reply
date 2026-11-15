@@ -2,10 +2,11 @@
 
 import LanguageSwitcher from "@/components/language-switcher";
 import { useI18n } from "@/lib/i18n/provider";
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useState } from "react";
 import type { AccountOption } from "@/components/account-select";
 import { ZernioConnection } from "@/components/zernio-connection";
 import { MetaConnectNotice } from "@/components/meta-connect-notice";
+import { SettingsUnlockForm } from "@/components/settings-unlock-form";
 
 interface SettingsData {
   workspace: {
@@ -89,8 +90,10 @@ export default function SettingsPage() {
     null
   );
   const [facebookConnectOk, setFacebookConnectOk] = useState<string | null>(null);
+  const [settingsUnlocked, setSettingsUnlocked] = useState(false);
 
-  useEffect(() => {
+  const loadSettings = useCallback(() => {
+    setLoading(true);
     Promise.all([
       fetch("/api/dashboard/stats").then((res) => res.json()),
       fetch("/api/workspace/members").then((res) => res.json()),
@@ -103,6 +106,21 @@ export default function SettingsPage() {
       })
       .finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => {
+    fetch("/api/settings-unlock")
+      .then((res) => res.json())
+      .then((payload) => {
+        const unlocked = Boolean(payload.unlocked);
+        setSettingsUnlocked(unlocked);
+        if (unlocked) loadSettings();
+        else setLoading(false);
+      })
+      .catch(() => {
+        setSettingsUnlocked(false);
+        setLoading(false);
+      });
+  }, [loadSettings]);
 
   async function refreshMembers() {
     const res = await fetch("/api/workspace/members");
@@ -304,6 +322,17 @@ export default function SettingsPage() {
     membersData?.currentUserRole === "OWNER" ||
     membersData?.currentUserRole === "ADMIN";
 
+  if (!settingsUnlocked) {
+    return (
+      <SettingsUnlockForm
+        onUnlocked={() => {
+          setSettingsUnlocked(true);
+          loadSettings();
+        }}
+      />
+    );
+  }
+
   return (
     <div className="max-w-2xl mx-auto space-y-8">
       {/* Surfaces the ?instagram= code the OAuth routes redirect back with.
@@ -312,6 +341,22 @@ export default function SettingsPage() {
       <Suspense fallback={null}>
         <MetaConnectNotice />
       </Suspense>
+      <div className="flex justify-end">
+        <button
+          type="button"
+          className="text-xs text-muted hover:text-foreground"
+          onClick={async () => {
+            await fetch("/api/settings-unlock", { method: "DELETE" });
+            setSettingsUnlocked(false);
+            setData(null);
+            setFacebookPages([]);
+            setSystemUserToken("");
+            setFacebookToken("");
+          }}
+        >
+          Lock settings
+        </button>
+      </div>
 
       <section className="panel rounded p-4 sm:p-6 space-y-3">
         <h2 className="text-base font-semibold">{t("Interface language")}</h2>
