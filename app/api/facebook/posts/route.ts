@@ -6,6 +6,8 @@ import {
   getFacebookPostCommentCount,
   listFacebookPagePosts,
 } from "@/lib/meta/facebook-messages";
+import { encryptToken } from "@/lib/meta/oauth";
+import { resolveFacebookPageAccessToken } from "@/lib/meta/page-token";
 
 export async function GET(request: NextRequest) {
   const workspaceId = await getCurrentWorkspaceId();
@@ -38,10 +40,33 @@ export async function GET(request: NextRequest) {
 
   try {
     const ctx = createFacebookContext(page);
+    // Stored token is sometimes the System User token; Graph needs the Page token.
+    const resolved = await resolveFacebookPageAccessToken({
+      pageId: ctx.pageId,
+      storedToken: ctx.accessToken,
+    });
+    if (resolved.refreshed) {
+      await prisma.facebookPage
+        .update({
+          where: { id: page.id },
+          data: {
+            accessToken: encryptToken(resolved.accessToken),
+            tokenExpiresAt: new Date(Date.now() + 60 * 24 * 60 * 60 * 1000),
+          },
+        })
+        .catch((error) => {
+          console.warn(
+            "[Facebook Posts] Failed to persist refreshed page token:",
+            error instanceof Error ? error.message : error
+          );
+        });
+    }
+
+    const accessToken = resolved.accessToken;
     const postId = request.nextUrl.searchParams.get("postId");
     if (postId) {
       const commentsCount = await getFacebookPostCommentCount(
-        ctx.accessToken,
+        accessToken,
         postId
       );
       return NextResponse.json({
@@ -51,7 +76,7 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    const posts = await listFacebookPagePosts(ctx.accessToken, ctx.pageId, 60);
+    const posts = await listFacebookPagePosts(accessToken, ctx.pageId, 60);
     return NextResponse.json({
       success: true,
       data: posts.map((p) => ({
@@ -61,16 +86,18 @@ export async function GET(request: NextRequest) {
         permalink: p.permalink_url ?? null,
         mediaUrl: p.full_picture ?? p.picture ?? null,
         mediaType:
-          p.status_type === "added_video" || p.status_type === "mobile_status_update"
+          p.status_type === "added_video" ||
+          p.status_type === "mobile_status_update"
             ? "VIDEO"
             : "IMAGE",
         commentsCount: p.commentsCount ?? 0,
       })),
       page: { id: page.id, pageId: page.pageId, name: page.name },
+      tokenRefreshed: resolved.refreshed,
       limitations:
         posts.length === 0
           ? [
-              "No Facebook posts returned for this Page. Check Page token permissions (pages_read_engagement / pages_read_user_content) or publish a post as the Page.",
+              "No Facebook posts returned for this Page. Re-paste the System User token in Settings so we can store each Page access token, and confirm pages_read_engagement is granted.",
             ]
           : [],
     });

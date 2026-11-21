@@ -116,12 +116,14 @@ export default function PostPicker({
       params.set("all", "true");
     }
 
+    // v3: bust empty caches from System-User-token failures before page-token fix.
     const cacheKey = isFacebook
-      ? `fb-posts:v2:${facebookPageId ?? "default"}`
-      : `ig-posts:v2:${instagramAccountId ?? "default"}`;
+      ? `fb-posts:v3:${facebookPageId ?? "default"}`
+      : `ig-posts:v3:${instagramAccountId ?? "default"}`;
     const cached = readCache<InstagramPost[]>(cacheKey, 15 * 60 * 1000);
     /* eslint-disable react-hooks/set-state-in-effect */
-    if (cached.data) {
+    // Never hydrate from an empty cache — it hides real Meta errors for 15 min.
+    if (cached.data && cached.data.length > 0) {
       setPosts(cached.data);
       setLoading(false);
     }
@@ -158,7 +160,7 @@ export default function PostPicker({
             : data.data;
           setPosts(normalized);
           setLimitations(data.limitations ?? []);
-          writeCache(cacheKey, normalized);
+          if (normalized.length > 0) writeCache(cacheKey, normalized);
         } else if (!cached.data) {
           setError(data.error ?? "Failed to load posts");
         }

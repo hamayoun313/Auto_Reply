@@ -1,0 +1,203 @@
+import { getMetaGraphApiVersion } from "@/lib/env";
+import { noteMetaAppUsageFromResponse } from "@/lib/meta/app-rate-limit-circuit";
+
+function facebookGraphBase() {
+  return `https://graph.facebook.com/${getMetaGraphApiVersion()}`;
+}
+
+async function graphGet<T>(url: URL): Promise<T> {
+  const response = await fetch(url.toString());
+  await noteMetaAppUsageFromResponse(response).catch(() => {});
+  const json = (await response.json()) as T & {
+    error?: { message?: string; code?: number };
+  };
+  if (!response.ok || json.error) {
+    throw new Error(json.error?.message ?? `Meta HTTP ${response.status}`);
+  }
+  return json;
+}
+
+function systemUserToken(): string | null {
+  const token = process.env.META_SYSTEM_USER_TOKEN?.trim();
+  return token || null;
+}
+
+/**
+ * Probe whether a token can act as this Facebook Page for read edges.
+ * System User tokens often list /me/accounts but fail on /{page-id}/posts.
+ */
+export async function canReadFacebookPagePosts(
+  accessToken: string,
+  pageId: string
+): Promise<boolean> {
+  try {
+    const url = new URL(`${facebookGraphBase()}/${pageId}/posts`);
+    url.searchParams.set("fields", "id");
+    url.searchParams.set("limit", "1");
+    url.searchParams.set("access_token", accessToken);
+    await graphGet(url);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function canReadInstagramMedia(
+  accessToken: string,
+  instagramId: string
+): Promise<boolean> {
+  try {
+    const url = new URL(`${facebookGraphBase()}/${instagramId}/media`);
+    url.searchParams.set("fields", "id");
+    url.searchParams.set("limit", "1");
+    url.searchParams.set("access_token", accessToken);
+    await graphGet(url);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+type PageWithTokens = {
+  id: string;
+  name?: string;
+  access_token?: string;
+  instagram_business_account?: { id?: string; username?: string };
+};
+
+/**
+ * Load Page-scoped tokens from a user/system-user token via /me/accounts.
+ */
+export async function listPagesWithAccessTokens(
+  accessToken: string
+): Promise<PageWithTokens[]> {
+  const url = new URL(`${facebookGraphBase()}/me/accounts`);
+  url.searchParams.set(
+    "fields",
+    "id,name,access_token,instagram_business_account{id,username}"
+  );
+  url.searchParams.set("limit", "100");
+  url.searchParams.set("access_token", accessToken);
+  const data = await graphGet<{ data?: PageWithTokens[] }>(url);
+  return data.data ?? [];
+}
+
+/** Resolve a Page access token that can read posts for this Page. */
+export async function resolveFacebookPageAccessToken(opts: {
+  pageId: string;
+  storedToken: string;
+}): Promise<{ accessToken: string; refreshed: boolean }> {
+  if (await canReadFacebookPagePosts(opts.storedToken, opts.pageId)) {
+    return { accessToken: opts.storedToken, refreshed: false };
+  }
+
+  const candidates = [systemUserToken(), opts.storedToken].filter(
+    (t, i, arr): t is string => Boolean(t) && arr.indexOf(t) === i
+  );
+
+  for (const candidate of candidates) {
+    try {
+      const pages = await listPagesWithAccessTokens(candidate);
+      const match = pages.find((p) => p.id === opts.pageId);
+      const pageToken = match?.access_token?.trim();
+      if (
+        pageToken &&
+        (await canReadFacebookPagePosts(pageToken, opts.pageId))
+      ) {
+        return { accessToken: pageToken, refreshed: true };
+      }
+    } catch (error) {
+      console.warn(
+        "[Meta] resolveFacebookPageAccessToken via /me/accounts failed:",
+        error instanceof Error ? error.message : error
+      );
+    }
+
+    // Direct Page lookup sometimes returns access_token for SU tokens.
+    try {
+      const url = new URL(`${facebookGraphBase()}/${opts.pageId}`);
+      url.searchParams.set("fields", "id,access_token");
+      url.searchParams.set("access_token", candidate);
+      const page = await graphGet<{ id?: string; access_token?: string }>(url);
+      const pageToken = page.access_token?.trim();
+      if (
+        pageToken &&
+        (await canReadFacebookPagePosts(pageToken, opts.pageId))
+      ) {
+        return { accessToken: pageToken, refreshed: true };
+      }
+    } catch {
+      // try next candidate
+    }
+  }
+
+  // Last resort: return stored token (caller will surface Meta's error).
+  return { accessToken: opts.storedToken, refreshed: false };
+}
+
+/**
+ * Resolve a token that can list Instagram media for this IG business account.
+ * Page-scoped tokens work; raw System User tokens often do not.
+ */
+export async function resolveInstagramMediaAccessToken(opts: {
+  instagramId: string;
+  storedToken: string;
+  /** Optional Facebook Page Graph id if already known. */
+  facebookPageId?: string | null;
+}): Promise<{ accessToken: string; refreshed: boolean }> {
+  if (await canReadInstagramMedia(opts.storedToken, opts.instagramId)) {
+    return { accessToken: opts.storedToken, refreshed: false };
+  }
+
+  const candidates = [systemUserToken(), opts.storedToken].filter(
+    (t, i, arr): t is string => Boolean(t) && arr.indexOf(t) === i
+  );
+
+  for (const candidate of candidates) {
+    try {
+      const pages = await listPagesWithAccessTokens(candidate);
+      const match =
+        pages.find(
+          (p) => p.instagram_business_account?.id === opts.instagramId
+        ) ??
+        (opts.facebookPageId
+          ? pages.find((p) => p.id === opts.facebookPageId)
+          : undefined);
+      const pageToken = match?.access_token?.trim();
+      if (
+        pageToken &&
+        (await canReadInstagramMedia(pageToken, opts.instagramId))
+      ) {
+        return { accessToken: pageToken, refreshed: true };
+      }
+    } catch (error) {
+      console.warn(
+        "[Meta] resolveInstagramMediaAccessToken via /me/accounts failed:",
+        error instanceof Error ? error.message : error
+      );
+    }
+  }
+
+  return { accessToken: opts.storedToken, refreshed: false };
+}
+
+/** Map Instagram business account id → Page access token from a SU/user token. */
+export async function mapInstagramIdsToPageTokens(
+  accessToken: string
+): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  try {
+    const pages = await listPagesWithAccessTokens(accessToken);
+    for (const page of pages) {
+      const igId = page.instagram_business_account?.id;
+      const pageToken = page.access_token?.trim();
+      if (igId && pageToken) map.set(igId, pageToken);
+    }
+  } catch (error) {
+    console.warn(
+      "[Meta] mapInstagramIdsToPageTokens failed:",
+      error instanceof Error ? error.message : error
+    );
+  }
+  return map;
+}

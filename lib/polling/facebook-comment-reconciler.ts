@@ -93,6 +93,23 @@ export async function reconcileFacebookComments(): Promise<void> {
       continue;
     }
 
+    let pageAccessToken = ctx.accessToken;
+    try {
+      const { resolveFacebookPageAccessToken } = await import(
+        "@/lib/meta/page-token"
+      );
+      const resolved = await resolveFacebookPageAccessToken({
+        pageId: page.pageId,
+        storedToken: ctx.accessToken,
+      });
+      pageAccessToken = resolved.accessToken;
+    } catch (e) {
+      console.warn(
+        `[FB Comment Poll] Page token resolve failed for ${page.name}:`,
+        e instanceof Error ? e.message : e
+      );
+    }
+
     // Specific post(s), or recent feed for matchAnyPost (webhook-less Railway).
     const targetPosts: Array<{ id: string; alternateIds: string[] }> = [];
     const specificIds = [
@@ -112,7 +129,7 @@ export async function reconcileFacebookComments(): Promise<void> {
     } else if (automation.matchAnyPost) {
       try {
         const feed = await listFacebookPagePosts(
-          ctx.accessToken,
+          pageAccessToken,
           page.pageId,
           ANY_POST_FEED_LIMIT
         );
@@ -144,7 +161,7 @@ export async function reconcileFacebookComments(): Promise<void> {
       try {
         do {
           const { comments, nextCursor } = await listFacebookPostComments(
-            ctx.accessToken,
+            pageAccessToken,
             primaryPostId,
             { limit: 50, after }
           );

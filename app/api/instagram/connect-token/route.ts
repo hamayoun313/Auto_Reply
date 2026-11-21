@@ -8,6 +8,7 @@ import {
   subscribeInstagramAccountToWebhooks,
 } from "@/lib/meta/client";
 import { encryptToken } from "@/lib/meta/oauth";
+import { mapInstagramIdsToPageTokens } from "@/lib/meta/page-token";
 import { requireSettingsUnlock } from "@/lib/settings-access";
 import { canManageWorkspace, getCurrentWorkspaceContext } from "@/lib/workspace-access";
 
@@ -168,6 +169,10 @@ export async function POST(request: NextRequest) {
     }> = [];
     const skipped: Array<{ instagramId: string; reason: string }> = [];
 
+    // Prefer Page-scoped tokens for media/posts; System User tokens often
+    // cannot call /{ig-user-id}/media even though they discover the account.
+    const pageTokensByIgId = await mapInstagramIdsToPageTokens(accessToken);
+
     for (const instagramId of requestedIds) {
       let account: DiscoveredAccount | null =
         discovered.find((a) => a.id === instagramId) ?? null;
@@ -179,9 +184,12 @@ export async function POST(request: NextRequest) {
         continue;
       }
 
+      const tokenForAccount =
+        pageTokensByIgId.get(account.id)?.trim() || accessToken;
+
       const result = await saveOneInstagramAccount({
         workspaceId: context.workspaceId,
-        accessToken,
+        accessToken: tokenForAccount,
         account,
       });
       if (!result.ok) {
