@@ -201,3 +201,57 @@ export async function mapInstagramIdsToPageTokens(
   }
   return map;
 }
+
+export type LiveInstagramLink = {
+  instagramId: string;
+  username: string;
+  pageId: string;
+  pageName: string;
+  pageAccessToken: string;
+};
+
+/** Live IG accounts linked to Pages for this System User / user token. */
+export async function listLiveInstagramLinks(
+  accessToken?: string | null
+): Promise<LiveInstagramLink[]> {
+  const token = accessToken?.trim() || systemUserToken();
+  if (!token) return [];
+  const pages = await listPagesWithAccessTokens(token);
+  const links: LiveInstagramLink[] = [];
+  for (const page of pages) {
+    const igId = page.instagram_business_account?.id?.trim();
+    const username = page.instagram_business_account?.username?.trim();
+    const pageToken = page.access_token?.trim();
+    if (!igId || !username || !pageToken || !page.id) continue;
+    links.push({
+      instagramId: igId,
+      username,
+      pageId: page.id,
+      pageName: page.name ?? page.id,
+      pageAccessToken: pageToken,
+    });
+  }
+  return links;
+}
+
+/**
+ * Stale DB rows sometimes keep an old Instagram business id (Graph #100/33).
+ * Rematch by username against live Page→IG links.
+ */
+export async function rematchInstagramByUsername(opts: {
+  username: string;
+  accessToken?: string | null;
+}): Promise<LiveInstagramLink | null> {
+  const needle = opts.username.trim().replace(/^@/, "").toLowerCase();
+  if (!needle) return null;
+  const links = await listLiveInstagramLinks(opts.accessToken);
+  return (
+    links.find((l) => l.username.toLowerCase() === needle) ??
+    links.find(
+      (l) =>
+        l.username.toLowerCase().includes(needle) ||
+        needle.includes(l.username.toLowerCase())
+    ) ??
+    null
+  );
+}
