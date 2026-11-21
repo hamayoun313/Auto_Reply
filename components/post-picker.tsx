@@ -87,12 +87,16 @@ export default function PostPicker({
   const [shown, setShown] = useState(PAGE_SIZE);
   const [brokenThumbs, setBrokenThumbs] = useState<Record<string, true>>({});
   const [pickedMeta, setPickedMeta] = useState<Record<string, PostPick>>({});
+  const [fbUrl, setFbUrl] = useState("");
+  const [fbUrlBusy, setFbUrlBusy] = useState(false);
+  const [fbUrlMessage, setFbUrlMessage] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     const isFacebook = channel === "facebook";
     setError(null);
     setLimitations([]);
+    setFbUrlMessage(null);
     setShown(PAGE_SIZE);
     setBrokenThumbs({});
     if (isFacebook && !facebookPageId) {
@@ -116,9 +120,9 @@ export default function PostPicker({
       params.set("all", "true");
     }
 
-    // v3: bust empty caches from System-User-token failures before page-token fix.
+    // v4: includes Facebook Reels from /video_reels (share/r links).
     const cacheKey = isFacebook
-      ? `fb-posts:v3:${facebookPageId ?? "default"}`
+      ? `fb-posts:v4:${facebookPageId ?? "default"}`
       : `ig-posts:v3:${instagramAccountId ?? "default"}`;
     const cached = readCache<InstagramPost[]>(cacheKey, 15 * 60 * 1000);
     /* eslint-disable react-hooks/set-state-in-effect */
@@ -189,6 +193,61 @@ export default function PostPicker({
       const first = picks[0];
       if (!first) onSelect(null);
       else onSelect(first.postId, first.postUrl, first.thumbUrl, first.caption);
+    }
+  }
+
+  async function resolveFacebookUrl() {
+    if (channel !== "facebook" || !facebookPageId || !fbUrl.trim()) return;
+    setFbUrlBusy(true);
+    setFbUrlMessage(null);
+    try {
+      const params = new URLSearchParams({
+        facebookPageId,
+        url: fbUrl.trim(),
+      });
+      const res = await fetch(`/api/facebook/posts?${params}`);
+      const data = await res.json();
+      if (!data.success || !Array.isArray(data.data) || data.data.length === 0) {
+        setFbUrlMessage(
+          data.error ?? t("Could not resolve that Facebook link.")
+        );
+        return;
+      }
+      if (data.warning) {
+        setFbUrlMessage(data.warning);
+      }
+      const row = data.data[0] as {
+        id: string;
+        caption?: string;
+        mediaUrl?: string;
+        permalink?: string;
+        mediaType?: string;
+        timestamp?: string | null;
+      };
+      const normalized: InstagramPost = {
+        id: row.id,
+        caption: row.caption,
+        media_type: row.mediaType ?? "IMAGE",
+        media_url: row.mediaUrl,
+        thumbnail_url: row.mediaUrl,
+        permalink: row.permalink,
+        timestamp: row.timestamp ?? "",
+      };
+      setPosts((prev) => {
+        if (prev.some((p) => p.id === normalized.id)) return prev;
+        return [normalized, ...prev];
+      });
+      if (data.belongsToSelectedPage !== false) {
+        togglePost(normalized);
+        if (!data.warning) {
+          setFbUrlMessage(t("Post added from link."));
+          setFbUrl("");
+        }
+      }
+    } catch {
+      setFbUrlMessage(t("Could not resolve that Facebook link."));
+    } finally {
+      setFbUrlBusy(false);
     }
   }
 
@@ -279,6 +338,34 @@ export default function PostPicker({
           {note}
         </p>
       ))}
+      {channel === "facebook" ? (
+        <div className="space-y-2 rounded-lg border border-border p-2">
+          <p className="px-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+            {t("Paste Facebook post / reel link")}
+          </p>
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <input
+              value={fbUrl}
+              onChange={(e) => setFbUrl(e.target.value)}
+              placeholder="https://www.facebook.com/share/r/…"
+              className="w-full min-w-0 rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none"
+            />
+            <button
+              type="button"
+              disabled={fbUrlBusy || !fbUrl.trim()}
+              onClick={() => void resolveFacebookUrl()}
+              className="shrink-0 rounded-lg bg-accent px-3 py-2 text-sm font-medium text-white disabled:opacity-60"
+            >
+              {fbUrlBusy ? t("Resolving…") : t("Add link")}
+            </button>
+          </div>
+          {fbUrlMessage ? (
+            <p className="px-1 text-xs text-muted" dir="auto">
+              {fbUrlMessage}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
       <div className="flex items-center justify-between gap-2">
         <input
           value={query}

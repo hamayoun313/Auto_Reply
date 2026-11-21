@@ -317,48 +317,98 @@ export async function getFacebookPostCommentCount(
   return typeof total === "number" ? total : null;
 }
 
+type VideoReelRow = {
+  id?: string;
+  description?: string | null;
+  created_time?: string;
+  permalink_url?: string | null;
+  picture?: string | null;
+  source?: string | null;
+};
+
+/**
+ * List Page posts + Reels. Facebook Reels often never appear on
+ * /published_posts — they live on /video_reels — so we merge both.
+ */
 export async function listFacebookPagePosts(
   accessToken: string,
   pageId: string,
-  limit = 40
+  limit = 60
 ): Promise<FacebookPagePost[]> {
-  const fields =
-    "id,message,created_time,permalink_url,full_picture,picture,status_type,attachments{media,type,url,subattachments},comments.summary(true).limit(0)";
+  // Avoid deprecated attachment field combos that 500 the whole edge on v25.
+  const postFields =
+    "id,message,created_time,permalink_url,full_picture,picture,status_type,comments.summary(true).limit(0)";
+  const reelFields =
+    "id,description,created_time,permalink_url,picture,source";
 
-  async function fetchEdge(edge: "published_posts" | "posts" | "feed") {
+  async function fetchEdge(
+    edge: "published_posts" | "posts" | "feed" | "video_reels" | "videos",
+    fields: string
+  ): Promise<FacebookPagePost[]> {
     const url = new URL(`${facebookGraphBase()}/${pageId}/${edge}`);
     url.searchParams.set("fields", fields);
     url.searchParams.set("limit", String(Math.min(100, Math.max(1, limit))));
     url.searchParams.set("access_token", accessToken);
     const response = await fetch(url.toString());
+    if (edge === "video_reels" || edge === "videos") {
+      const data = await handleResponse<{ data?: VideoReelRow[] }>(response);
+      return (data.data ?? [])
+        .filter((row) => Boolean(row.id))
+        .map((row) => ({
+          id: row.id!,
+          message: row.description ?? "",
+          created_time: row.created_time,
+          permalink_url: row.permalink_url
+            ? row.permalink_url.startsWith("http")
+              ? row.permalink_url
+              : `https://www.facebook.com${row.permalink_url}`
+            : `https://www.facebook.com/reel/${row.id}`,
+          full_picture: row.picture ?? null,
+          picture: row.picture ?? null,
+          status_type: "added_video",
+          commentsCount: 0,
+        }));
+    }
     const data = await handleResponse<{ data?: FacebookPagePost[] }>(response);
     return data.data ?? [];
   }
 
-  // published_posts = Page's own content; fall back to posts/feed when empty
-  // (some tokens only return data on one of these edges).
-  let rows: FacebookPagePost[] = [];
-  try {
-    rows = await fetchEdge("published_posts");
-  } catch {
-    rows = [];
-  }
-  if (rows.length === 0) {
+  async function safeEdge(
+    edge: "published_posts" | "posts" | "feed" | "video_reels" | "videos",
+    fields: string
+  ) {
     try {
-      rows = await fetchEdge("posts");
-    } catch {
-      rows = [];
+      return await fetchEdge(edge, fields);
+    } catch (error) {
+      console.warn(
+        `[Facebook] ${edge} failed:`,
+        error instanceof Error ? error.message : error
+      );
+      return [] as FacebookPagePost[];
     }
   }
+
+  const [published, posts, reels, videos] = await Promise.all([
+    safeEdge("published_posts", postFields),
+    safeEdge("posts", postFields),
+    safeEdge("video_reels", reelFields),
+    safeEdge("videos", reelFields),
+  ]);
+
+  let rows = [...published, ...posts, ...reels, ...videos];
   if (rows.length === 0) {
-    rows = await fetchEdge("feed");
+    rows = await safeEdge("feed", postFields);
   }
 
   const seen = new Set<string>();
-  return rows
+  const merged = rows
     .filter((post) => {
       if (!post.id || seen.has(post.id)) return false;
+      // Also dedupe pageId_postId vs bare video id when both appear.
+      const bare = post.id.includes("_") ? post.id.split("_").pop()! : post.id;
+      if (seen.has(bare)) return false;
       seen.add(post.id);
+      seen.add(bare);
       return true;
     })
     .map((post) => ({
@@ -366,4 +416,103 @@ export async function listFacebookPagePosts(
       full_picture: facebookPostThumb(post) ?? post.full_picture ?? null,
       commentsCount: post.comments?.summary?.total_count ?? 0,
     }));
+
+  merged.sort((a, b) => {
+    const ta = a.created_time ? Date.parse(a.created_time) : 0;
+    const tb = b.created_time ? Date.parse(b.created_time) : 0;
+    return tb - ta;
+  });
+
+  return merged.slice(0, Math.max(limit, 60));
+}
+
+export type ResolvedFacebookPost = FacebookPagePost & {
+  fromPageId?: string | null;
+  fromPageName?: string | null;
+};
+
+/**
+ * Resolve facebook.com/share/… or story.php links to a Graph post object.
+ * Share/r short links redirect to story_fbid + page id.
+ */
+export async function resolveFacebookPostFromUrl(
+  accessToken: string,
+  pageId: string,
+  rawUrl: string
+): Promise<ResolvedFacebookPost | null> {
+  const input = rawUrl.trim();
+  if (!input) return null;
+
+  let storyFbid: string | null = null;
+  let sharePageId: string | null = null;
+
+  const storyMatch = input.match(/[?&]story_fbid=(\d+)/i);
+  const idMatch = input.match(/[?&]id=(\d+)/i);
+  const reelMatch = input.match(/\/reel\/(\d+)/i);
+  const postsMatch = input.match(/\/posts\/(\d+)/i);
+  const pfbidMatch = input.match(/\/posts\/(pfbid\w+)/i);
+
+  if (storyMatch) storyFbid = storyMatch[1];
+  if (idMatch) sharePageId = idMatch[1];
+  if (reelMatch) storyFbid = reelMatch[1];
+  if (postsMatch) storyFbid = postsMatch[1];
+
+  if (!storyFbid && /facebook\.com\/share\//i.test(input)) {
+    try {
+      const redirected = await fetch(input, {
+        method: "GET",
+        redirect: "manual",
+        headers: { "user-agent": "Mozilla/5.0" },
+      });
+      const location = redirected.headers.get("location") ?? "";
+      const locStory = location.match(/[?&]story_fbid=(\d+)/i);
+      const locId = location.match(/[?&]id=(\d+)/i);
+      const locReel = location.match(/\/reel\/(\d+)/i);
+      if (locStory) storyFbid = locStory[1];
+      if (locId) sharePageId = locId[1];
+      if (locReel) storyFbid = locReel[1];
+    } catch (error) {
+      console.warn(
+        "[Facebook] share redirect failed:",
+        error instanceof Error ? error.message : error
+      );
+    }
+  }
+
+  const candidates = new Set<string>();
+  if (storyFbid && sharePageId) candidates.add(`${sharePageId}_${storyFbid}`);
+  if (storyFbid) {
+    candidates.add(`${pageId}_${storyFbid}`);
+    candidates.add(storyFbid);
+  }
+  if (pfbidMatch) candidates.add(`${pageId}_${pfbidMatch[1]}`);
+  // Bare Graph id pasted by the user.
+  if (/^\d+(?:_\d+)?$/.test(input)) candidates.add(input);
+
+  for (const candidate of candidates) {
+    try {
+      const url = new URL(`${facebookGraphBase()}/${candidate}`);
+      url.searchParams.set(
+        "fields",
+        "id,message,created_time,permalink_url,full_picture,picture,status_type,from{id,name},comments.summary(true).limit(0)"
+      );
+      url.searchParams.set("access_token", accessToken);
+      const response = await fetch(url.toString());
+      const post = await handleResponse<
+        FacebookPagePost & { from?: { id?: string; name?: string } }
+      >(response);
+      if (!post.id) continue;
+      return {
+        ...post,
+        full_picture: facebookPostThumb(post) ?? post.full_picture ?? null,
+        commentsCount: post.comments?.summary?.total_count ?? 0,
+        fromPageId: post.from?.id ?? sharePageId,
+        fromPageName: post.from?.name ?? null,
+      };
+    } catch {
+      // try next candidate
+    }
+  }
+
+  return null;
 }

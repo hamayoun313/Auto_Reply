@@ -5,6 +5,7 @@ import { createFacebookContext } from "@/lib/facebook/context";
 import {
   getFacebookPostCommentCount,
   listFacebookPagePosts,
+  resolveFacebookPostFromUrl,
 } from "@/lib/meta/facebook-messages";
 import { encryptToken } from "@/lib/meta/oauth";
 import { resolveFacebookPageAccessToken } from "@/lib/meta/page-token";
@@ -76,7 +77,55 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    const posts = await listFacebookPagePosts(accessToken, ctx.pageId, 60);
+    const shareUrl = request.nextUrl.searchParams.get("url")?.trim();
+    if (shareUrl) {
+      const resolvedPost = await resolveFacebookPostFromUrl(
+        accessToken,
+        ctx.pageId,
+        shareUrl
+      );
+      if (!resolvedPost) {
+        return NextResponse.json(
+          {
+            success: false,
+            error:
+              "Could not resolve that Facebook link. Open the post, copy the browser URL (or share/r link), and try again.",
+          },
+          { status: 404 }
+        );
+      }
+      const fromId = resolvedPost.fromPageId ?? null;
+      const belongsToSelected =
+        !fromId ||
+        fromId === ctx.pageId ||
+        resolvedPost.id.startsWith(`${ctx.pageId}_`);
+      return NextResponse.json({
+        success: true,
+        data: [
+          {
+            id: resolvedPost.id,
+            caption: resolvedPost.message ?? "",
+            timestamp: resolvedPost.created_time ?? null,
+            permalink: resolvedPost.permalink_url ?? shareUrl,
+            mediaUrl: resolvedPost.full_picture ?? resolvedPost.picture ?? null,
+            mediaType:
+              resolvedPost.status_type === "added_video" ? "VIDEO" : "IMAGE",
+            commentsCount: resolvedPost.commentsCount ?? 0,
+          },
+        ],
+        page: { id: page.id, pageId: page.pageId, name: page.name },
+        fromPage: {
+          id: fromId,
+          name: resolvedPost.fromPageName ?? null,
+        },
+        belongsToSelectedPage: belongsToSelected,
+        warning: belongsToSelected
+          ? null
+          : `This post belongs to “${resolvedPost.fromPageName ?? fromId}”, not “${page.name}”. Connect that Facebook Page in Settings (assign it to the System User), then select it here.`,
+      });
+    }
+
+    const posts = await listFacebookPagePosts(accessToken, ctx.pageId, 80);
     return NextResponse.json({
       success: true,
       data: posts.map((p) => ({
