@@ -22,6 +22,15 @@ function systemUserToken(): string | null {
   return token || null;
 }
 
+function isMissingAccountsFieldError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("nonexisting field (accounts)") ||
+    message.includes("nonexisting field (accounts)") ||
+    /Tried accessing nonexisting field \(accounts\)/i.test(message)
+  );
+}
+
 /**
  * Probe whether a token can act as this Facebook Page for read edges.
  * System User tokens often list /me/accounts but fail on /{page-id}/posts.
@@ -66,7 +75,8 @@ type PageWithTokens = {
 };
 
 /**
- * Load Page-scoped tokens from a user/system-user token via /me/accounts.
+ * Load Page-scoped tokens via /me/accounts.
+ * Only works with User / System User tokens — Page tokens throw (#100 accounts).
  */
 export async function listPagesWithAccessTokens(
   accessToken: string
@@ -78,8 +88,16 @@ export async function listPagesWithAccessTokens(
   );
   url.searchParams.set("limit", "100");
   url.searchParams.set("access_token", accessToken);
-  const data = await graphGet<{ data?: PageWithTokens[] }>(url);
-  return data.data ?? [];
+  try {
+    const data = await graphGet<{ data?: PageWithTokens[] }>(url);
+    return data.data ?? [];
+  } catch (error) {
+    if (isMissingAccountsFieldError(error)) {
+      // Page access tokens have no /me/accounts edge.
+      return [];
+    }
+    throw error;
+  }
 }
 
 /** Resolve a Page access token that can read posts for this Page. */
@@ -91,13 +109,11 @@ export async function resolveFacebookPageAccessToken(opts: {
     return { accessToken: opts.storedToken, refreshed: false };
   }
 
-  const candidates = [systemUserToken(), opts.storedToken].filter(
-    (t, i, arr): t is string => Boolean(t) && arr.indexOf(t) === i
-  );
-
-  for (const candidate of candidates) {
+  // Only System User tokens may call /me/accounts. Never use a Page token here.
+  const su = systemUserToken();
+  if (su) {
     try {
-      const pages = await listPagesWithAccessTokens(candidate);
+      const pages = await listPagesWithAccessTokens(su);
       const match = pages.find((p) => p.id === opts.pageId);
       const pageToken = match?.access_token?.trim();
       if (
@@ -113,11 +129,10 @@ export async function resolveFacebookPageAccessToken(opts: {
       );
     }
 
-    // Direct Page lookup sometimes returns access_token for SU tokens.
     try {
       const url = new URL(`${facebookGraphBase()}/${opts.pageId}`);
       url.searchParams.set("fields", "id,access_token");
-      url.searchParams.set("access_token", candidate);
+      url.searchParams.set("access_token", su);
       const page = await graphGet<{ id?: string; access_token?: string }>(url);
       const pageToken = page.access_token?.trim();
       if (
@@ -127,17 +142,16 @@ export async function resolveFacebookPageAccessToken(opts: {
         return { accessToken: pageToken, refreshed: true };
       }
     } catch {
-      // try next candidate
+      // fall through
     }
   }
 
-  // Last resort: return stored token (caller will surface Meta's error).
   return { accessToken: opts.storedToken, refreshed: false };
 }
 
 /**
  * Resolve a token that can list Instagram media for this IG business account.
- * Page-scoped tokens work; raw System User tokens often do not.
+ * Page-scoped tokens work; never call /me/accounts with a Page token.
  */
 export async function resolveInstagramMediaAccessToken(opts: {
   instagramId: string;
@@ -149,13 +163,10 @@ export async function resolveInstagramMediaAccessToken(opts: {
     return { accessToken: opts.storedToken, refreshed: false };
   }
 
-  const candidates = [systemUserToken(), opts.storedToken].filter(
-    (t, i, arr): t is string => Boolean(t) && arr.indexOf(t) === i
-  );
-
-  for (const candidate of candidates) {
+  const su = systemUserToken();
+  if (su) {
     try {
-      const pages = await listPagesWithAccessTokens(candidate);
+      const pages = await listPagesWithAccessTokens(su);
       const match =
         pages.find(
           (p) => p.instagram_business_account?.id === opts.instagramId
@@ -214,37 +225,45 @@ export type LiveInstagramLink = {
 export async function listLiveInstagramLinks(
   accessToken?: string | null
 ): Promise<LiveInstagramLink[]> {
-  const token = accessToken?.trim() || systemUserToken();
+  // Prefer System User — Page tokens cannot call /me/accounts.
+  const token = systemUserToken() || accessToken?.trim() || null;
   if (!token) return [];
-  const pages = await listPagesWithAccessTokens(token);
-  const links: LiveInstagramLink[] = [];
-  for (const page of pages) {
-    const igId = page.instagram_business_account?.id?.trim();
-    const username = page.instagram_business_account?.username?.trim();
-    const pageToken = page.access_token?.trim();
-    if (!igId || !username || !pageToken || !page.id) continue;
-    links.push({
-      instagramId: igId,
-      username,
-      pageId: page.id,
-      pageName: page.name ?? page.id,
-      pageAccessToken: pageToken,
-    });
+  try {
+    const pages = await listPagesWithAccessTokens(token);
+    const links: LiveInstagramLink[] = [];
+    for (const page of pages) {
+      const igId = page.instagram_business_account?.id?.trim();
+      const username = page.instagram_business_account?.username?.trim();
+      const pageToken = page.access_token?.trim();
+      if (!igId || !username || !pageToken || !page.id) continue;
+      links.push({
+        instagramId: igId,
+        username,
+        pageId: page.id,
+        pageName: page.name ?? page.id,
+        pageAccessToken: pageToken,
+      });
+    }
+    return links;
+  } catch (error) {
+    if (isMissingAccountsFieldError(error)) return [];
+    throw error;
   }
-  return links;
 }
 
 /**
  * Stale DB rows sometimes keep an old Instagram business id (Graph #100/33).
- * Rematch by username against live Page→IG links.
+ * Rematch by username against live Page→IG links (System User only).
  */
 export async function rematchInstagramByUsername(opts: {
   username: string;
+  /** Ignored for /me/accounts — kept for API compat. Always uses System User. */
   accessToken?: string | null;
 }): Promise<LiveInstagramLink | null> {
   const needle = opts.username.trim().replace(/^@/, "").toLowerCase();
   if (!needle) return null;
-  const links = await listLiveInstagramLinks(opts.accessToken);
+  // Never pass a Page token into /me/accounts.
+  const links = await listLiveInstagramLinks(null);
   return (
     links.find((l) => l.username.toLowerCase() === needle) ??
     links.find(
@@ -254,4 +273,59 @@ export async function rematchInstagramByUsername(opts: {
     ) ??
     null
   );
+}
+
+/**
+ * Read Instagram business account linked to a Facebook Page using a Page token.
+ * This works even when the Page is not visible on System User /me/accounts.
+ */
+export async function fetchInstagramLinkedToFacebookPage(opts: {
+  pageId: string;
+  pageAccessToken: string;
+}): Promise<{
+  instagramId: string;
+  username?: string;
+  pageAccessToken: string;
+  pageId: string;
+} | null> {
+  try {
+    const url = new URL(`${facebookGraphBase()}/${opts.pageId}`);
+    url.searchParams.set(
+      "fields",
+      "id,name,instagram_business_account{id,username}"
+    );
+    url.searchParams.set("access_token", opts.pageAccessToken);
+    const page = await graphGet<{
+      id?: string;
+      name?: string;
+      instagram_business_account?: { id?: string; username?: string };
+    }>(url);
+    const igId = page.instagram_business_account?.id?.trim();
+    if (!igId) return null;
+    return {
+      instagramId: igId,
+      username: page.instagram_business_account?.username,
+      pageAccessToken: opts.pageAccessToken,
+      pageId: page.id ?? opts.pageId,
+    };
+  } catch (error) {
+    console.warn(
+      "[Meta] fetchInstagramLinkedToFacebookPage failed:",
+      error instanceof Error ? error.message : error
+    );
+    return null;
+  }
+}
+
+export function brandNameMatches(a: string, b: string): boolean {
+  const norm = (s: string) =>
+    s
+      .toLowerCase()
+      .normalize("NFKD")
+      .replace(/[\u0640\u200c\u200d]/g, "")
+      .replace(/[^\p{L}\p{N}]+/gu, "");
+  const x = norm(a);
+  const y = norm(b);
+  if (!x || !y) return false;
+  return x === y || x.includes(y) || y.includes(x);
 }

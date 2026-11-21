@@ -5,9 +5,11 @@ import { getWorkspaceInstagramAccount } from "@/lib/instagram-accounts";
 import { getAllUserMedia, getUserMedia } from "@/lib/instagram/provider";
 import { createInstagramContext } from "@/lib/instagram/provider";
 import type { InstagramContext } from "@/lib/instagram/context";
-import { encryptToken } from "@/lib/meta/oauth";
+import { decryptToken, encryptToken } from "@/lib/meta/oauth";
 import {
+  brandNameMatches,
   canReadInstagramMedia,
+  fetchInstagramLinkedToFacebookPage,
   rematchInstagramByUsername,
   resolveInstagramMediaAccessToken,
 } from "@/lib/meta/page-token";
@@ -25,12 +27,73 @@ async function loadPosts(
 
 function isDeadInstagramObjectError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
+  if (/nonexisting field \(accounts\)/i.test(message)) return false;
   return (
     message.includes("does not exist") ||
-    message.includes("code=100") ||
-    message.includes("sub=33") ||
-    message.includes("Unsupported get request")
+    message.includes("Unsupported get request") ||
+    (message.includes("code=100") && message.includes("sub=33"))
   );
+}
+
+async function repairFromWorkspaceFacebookPages(opts: {
+  accountId: string;
+  username: string;
+  workspaceId: string;
+}): Promise<{
+  instagramId: string;
+  accessToken: string;
+} | null> {
+  const pages = await prisma.facebookPage.findMany({
+    where: { workspaceId: opts.workspaceId },
+    select: { id: true, pageId: true, name: true, accessToken: true },
+  });
+  const candidates = pages.filter(
+    (page) =>
+      brandNameMatches(page.name, opts.username) ||
+      brandNameMatches(page.name, "hamakala") ||
+      brandNameMatches(page.name, "همه کالا") ||
+      brandNameMatches(page.name, "همه‌کالا")
+  );
+  const ordered = [
+    ...candidates,
+    ...pages.filter((p) => !candidates.some((c) => c.id === p.id)),
+  ];
+
+  for (const page of ordered) {
+    let pageToken: string;
+    try {
+      pageToken = decryptToken(page.accessToken);
+    } catch {
+      continue;
+    }
+    const linked = await fetchInstagramLinkedToFacebookPage({
+      pageId: page.pageId,
+      pageAccessToken: pageToken,
+    });
+    if (!linked) continue;
+    if (
+      linked.username &&
+      !brandNameMatches(linked.username, opts.username) &&
+      !brandNameMatches(opts.username, linked.username)
+    ) {
+      // Prefer username match; still allow if page name already matched.
+      if (!candidates.some((c) => c.id === page.id)) continue;
+    }
+    await prisma.instagramAccount.update({
+      where: { id: opts.accountId },
+      data: {
+        instagramId: linked.instagramId,
+        accessToken: encryptToken(linked.pageAccessToken),
+        tokenExpiresAt: new Date(Date.now() + 60 * 24 * 60 * 60 * 1000),
+        ...(linked.username ? { username: linked.username } : {}),
+      },
+    });
+    return {
+      instagramId: linked.instagramId,
+      accessToken: linked.pageAccessToken,
+    };
+  }
+  return null;
 }
 
 export async function GET(request: NextRequest) {
@@ -69,16 +132,23 @@ export async function GET(request: NextRequest) {
         storedToken: context.accessToken,
       });
 
-      // Dead / wrong Instagram business id in DB → rematch by @username.
       const readable = await canReadInstagramMedia(
         resolved.accessToken,
         context.instagramId
       );
+
       if (!readable) {
+        // 1) Rematch via System User /me/accounts (never with Page token).
         const match = await rematchInstagramByUsername({
           username: account.username,
-          accessToken: resolved.accessToken,
+        }).catch((error) => {
+          console.warn(
+            "[Instagram Posts] rematch failed:",
+            error instanceof Error ? error.message : error
+          );
+          return null;
         });
+
         if (match && match.instagramId !== account.instagramId) {
           console.warn(
             `[Instagram Posts] Repairing stale IG id for @${account.username}: ${account.instagramId} → ${match.instagramId}`
@@ -102,6 +172,32 @@ export async function GET(request: NextRequest) {
             accessToken: match.pageAccessToken,
             refreshed: true,
           };
+        } else {
+          // 2) Pages not on System User (e.g. همه کالا): repair from connected FB Page token.
+          const fromFb = await repairFromWorkspaceFacebookPages({
+            accountId: account.id,
+            username: account.username,
+            workspaceId,
+          });
+          if (fromFb) {
+            console.warn(
+              `[Instagram Posts] Repaired @${account.username} from linked Facebook Page → ${fromFb.instagramId}`
+            );
+            context = {
+              provider: "META",
+              accessToken: fromFb.accessToken,
+              instagramId: fromFb.instagramId,
+            };
+            tokenRefreshed = true;
+            idRepaired = true;
+            resolved = {
+              accessToken: fromFb.accessToken,
+              refreshed: true,
+            };
+            account = (await prisma.instagramAccount.findUnique({
+              where: { id: account.id },
+            }))!;
+          }
         }
       }
 
@@ -145,27 +241,16 @@ export async function GET(request: NextRequest) {
       if (context.provider !== "META" || !isDeadInstagramObjectError(error)) {
         throw error;
       }
-      const match = await rematchInstagramByUsername({
+      const fromFb = await repairFromWorkspaceFacebookPages({
+        accountId: account.id,
         username: account.username,
-        accessToken: context.accessToken,
+        workspaceId,
       });
-      if (!match) throw error;
-
-      console.warn(
-        `[Instagram Posts] Media failed for stale id; rematched @${account.username} → ${match.instagramId}`
-      );
-      account = await prisma.instagramAccount.update({
-        where: { id: account.id },
-        data: {
-          instagramId: match.instagramId,
-          accessToken: encryptToken(match.pageAccessToken),
-          tokenExpiresAt: new Date(Date.now() + 60 * 24 * 60 * 60 * 1000),
-        },
-      });
+      if (!fromFb) throw error;
       context = {
         provider: "META",
-        accessToken: match.pageAccessToken,
-        instagramId: match.instagramId,
+        accessToken: fromFb.accessToken,
+        instagramId: fromFb.instagramId,
       };
       tokenRefreshed = true;
       idRepaired = true;
@@ -178,13 +263,13 @@ export async function GET(request: NextRequest) {
       provider: account.provider,
       tokenRefreshed,
       idRepaired,
-      instagramId: account.instagramId,
+      instagramId: context.provider === "META" ? context.instagramId : account.instagramId,
       limitations:
         account.provider === "ZERNIO"
           ? ["Zernio returns the 25 most recent Instagram posts."]
           : posts.length === 0
             ? [
-                "No Instagram posts returned. Re-connect the account in Settings with the System User token so we can store the linked Page access token.",
+                "No Instagram posts returned. Re-connect the account in Settings with the System User token (or the Page token for همه کالا).",
               ]
             : [],
     });
@@ -192,15 +277,11 @@ export async function GET(request: NextRequest) {
     console.error("[Instagram Posts] Error:", err);
     const message =
       err instanceof Error ? err.message : "Failed to fetch Instagram posts";
-    const hint = isDeadInstagramObjectError(err)
-      ? ` Instagram id for @${account.username} is stale or not assigned to this System User. Re-connect that account in Settings (paste the System User token again).`
-      : "";
-    return NextResponse.json(
-      {
-        success: false,
-        error: `${message}${hint}`,
-      },
-      { status: 500 }
-    );
+    const cleaned = /nonexisting field \(accounts\)/i.test(message)
+      ? `Could not load Instagram posts for @${account.username}. Re-connect همه کالا in Settings (paste System User token, then select the Page + Instagram).`
+      : isDeadInstagramObjectError(err)
+        ? `${message} Instagram id for @${account.username} is stale. Re-connect that account in Settings.`
+        : message;
+    return NextResponse.json({ success: false, error: cleaned }, { status: 500 });
   }
 }

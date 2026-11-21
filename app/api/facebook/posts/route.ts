@@ -79,26 +79,69 @@ export async function GET(request: NextRequest) {
 
     const shareUrl = request.nextUrl.searchParams.get("url")?.trim();
     if (shareUrl) {
-      const resolvedPost = await resolveFacebookPostFromUrl(
+      let resolvedPost = await resolveFacebookPostFromUrl(
         accessToken,
         ctx.pageId,
         shareUrl
       );
+
+      // If the selected Page token cannot resolve it, try other connected Pages
+      // (e.g. paste while Topsii is selected but the reel is from همه کالا).
+      const workspacePages = await prisma.facebookPage.findMany({
+        where: { workspaceId },
+        select: { id: true, pageId: true, name: true, accessToken: true },
+      });
+      if (!resolvedPost) {
+        for (const other of workspacePages) {
+          if (other.id === page.id) continue;
+          try {
+            const otherCtx = createFacebookContext(other);
+            const otherResolved = await resolveFacebookPageAccessToken({
+              pageId: otherCtx.pageId,
+              storedToken: otherCtx.accessToken,
+            });
+            resolvedPost = await resolveFacebookPostFromUrl(
+              otherResolved.accessToken,
+              otherCtx.pageId,
+              shareUrl
+            );
+            if (resolvedPost) break;
+          } catch {
+            // try next page
+          }
+        }
+      }
+
       if (!resolvedPost) {
         return NextResponse.json(
           {
             success: false,
             error:
-              "Could not resolve that Facebook link. Open the post, copy the browser URL (or share/r link), and try again.",
+              "Could not resolve that Facebook link. Open the post as the Page, copy the URL, and make sure همه کالا (or the owning Page) is connected in Settings.",
           },
           { status: 404 }
         );
       }
       const fromId = resolvedPost.fromPageId ?? null;
+      const connectedOwner = workspacePages.find(
+        (p) =>
+          p.pageId === fromId ||
+          resolvedPost!.id.startsWith(`${p.pageId}_`) ||
+          (resolvedPost!.fromPageName &&
+            p.name
+              .toLowerCase()
+              .includes(resolvedPost!.fromPageName.toLowerCase().slice(0, 6)))
+      );
       const belongsToSelected =
         !fromId ||
         fromId === ctx.pageId ||
         resolvedPost.id.startsWith(`${ctx.pageId}_`);
+      let warning: string | null = null;
+      if (!belongsToSelected) {
+        warning = connectedOwner
+          ? `This post belongs to “${resolvedPost.fromPageName ?? connectedOwner.name}”. Switch the Facebook Page selector to “${connectedOwner.name}”, then add the link again.`
+          : `This post belongs to “${resolvedPost.fromPageName ?? fromId}”, not “${page.name}”. Connect that Facebook Page in Settings, then select it here.`;
+      }
       return NextResponse.json({
         success: true,
         data: [
@@ -117,11 +160,11 @@ export async function GET(request: NextRequest) {
         fromPage: {
           id: fromId,
           name: resolvedPost.fromPageName ?? null,
+          connectedPageRowId: connectedOwner?.id ?? null,
+          connectedPageName: connectedOwner?.name ?? null,
         },
         belongsToSelectedPage: belongsToSelected,
-        warning: belongsToSelected
-          ? null
-          : `This post belongs to “${resolvedPost.fromPageName ?? fromId}”, not “${page.name}”. Connect that Facebook Page in Settings (assign it to the System User), then select it here.`,
+        warning,
       });
     }
 
