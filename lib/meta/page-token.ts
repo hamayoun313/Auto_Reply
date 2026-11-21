@@ -324,8 +324,17 @@ export function brandNameMatches(a: string, b: string): boolean {
       .normalize("NFKD")
       .replace(/[\u0640\u200c\u200d]/g, "")
       .replace(/[^\p{L}\p{N}]+/gu, "");
-  const x = norm(a);
-  const y = norm(b);
-  if (!x || !y) return false;
-  return x === y || x.includes(y) || y.includes(x);
+  const stems = (s: string) => {
+    const full = norm(s);
+    const head = norm((s.split(/[._\s-]+/)[0] ?? s).trim());
+    return Array.from(new Set([full, head].filter((x) => x.length >= 3)));
+  };
+  const as = stems(a);
+  const bs = stems(b);
+  for (const x of as) {
+    for (const y of bs) {
+      if (x === y || x.includes(y) || y.includes(x)) return true;
+    }
+  }
+  return false;
 }

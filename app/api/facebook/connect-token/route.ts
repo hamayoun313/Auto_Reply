@@ -84,6 +84,11 @@ export async function POST(request: NextRequest) {
       pageId: string;
       name: string;
       webhookSubscribed: boolean;
+      syncedInstagram?: {
+        username: string;
+        instagramId: string;
+        previousInstagramId: string | null;
+      } | null;
     }> = [];
     const skipped: Array<{ pageId: string; reason: string }> = [];
 
@@ -116,7 +121,13 @@ export async function POST(request: NextRequest) {
         pageId: result.pageId,
         name: result.name,
         webhookSubscribed: result.webhookSubscribed,
+        syncedInstagram: result.syncedInstagram ?? null,
       });
+      if (result.syncedInstagram) {
+        console.info(
+          `[Facebook Token Connect] Synced IG @${result.syncedInstagram.username}: ${result.syncedInstagram.previousInstagramId} → ${result.syncedInstagram.instagramId}`
+        );
+      }
     }
 
     if (connected.length === 0) {

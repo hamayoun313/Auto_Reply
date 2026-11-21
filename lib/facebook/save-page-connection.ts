@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/db/client";
 import { canConnectFacebookPage } from "@/lib/facebook-pages";
+import { syncInstagramAccountFromFacebookPage } from "@/lib/instagram/sync-from-facebook-page";
 import { subscribeFacebookPageToWebhooks } from "@/lib/meta/facebook-pages";
 import { encryptToken } from "@/lib/meta/oauth";
 
@@ -14,6 +15,11 @@ export type SaveFacebookPageResult =
       pageId: string;
       name: string;
       webhookSubscribed: boolean;
+      syncedInstagram?: {
+        username: string;
+        instagramId: string;
+        previousInstagramId: string | null;
+      } | null;
     }
   | { ok: false; reason: "already_connected" };
 
@@ -80,10 +86,37 @@ export async function saveFacebookPageConnection(
     });
   }
 
+  let syncedInstagram: {
+    username: string;
+    instagramId: string;
+    previousInstagramId: string | null;
+  } | null = null;
+  try {
+    const synced = await syncInstagramAccountFromFacebookPage({
+      workspaceId: input.workspaceId,
+      pageId: input.page.id,
+      pageName: input.page.name,
+      pageAccessToken: input.page.accessToken,
+    });
+    if (synced) {
+      syncedInstagram = {
+        username: synced.username,
+        instagramId: synced.instagramId,
+        previousInstagramId: synced.previousInstagramId,
+      };
+    }
+  } catch (error) {
+    console.warn(
+      "[Facebook Connect] IG sync from Page failed:",
+      error instanceof Error ? error.message : error
+    );
+  }
+
   return {
     ok: true,
     pageId: input.page.id,
     name: input.page.name,
     webhookSubscribed,
+    syncedInstagram,
   };
 }

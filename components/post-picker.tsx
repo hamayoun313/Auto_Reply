@@ -166,7 +166,20 @@ export default function PostPicker({
           setLimitations(data.limitations ?? []);
           if (normalized.length > 0) writeCache(cacheKey, normalized);
         } else if (!cached.data) {
-          setError(data.error ?? "Failed to load posts");
+          const detail =
+            typeof data.error === "string"
+              ? data.error
+              : "Failed to load posts";
+          const diag = Array.isArray(data.diagnostics)
+            ? ` [diag: ${data.diagnostics
+                .map((d: { step?: string }) => d.step)
+                .filter(Boolean)
+                .join(" → ")}]`
+            : "";
+          setError(`${detail}${diag}`);
+          if (data.diagnostics) {
+            console.warn("[PostPicker] Instagram/Facebook diagnostics", data.diagnostics);
+          }
         }
       })
       .catch(() => {
@@ -305,11 +318,11 @@ export default function PostPicker({
         ? t("Select a Facebook Page above, then pick a post here.")
         : t("Select an Instagram account above, then pick a post or reel here.");
     return (
-      <div className="text-center py-8">
-        <p className="text-sm text-muted">
+      <div className="space-y-2 py-6 text-left">
+        <p className="text-sm text-muted break-words" dir="auto">
           {error === "Failed to load posts" ? t("Failed to load posts") : error}
         </p>
-        <p className="text-xs text-zinc-500 mt-1">{hint}</p>
+        <p className="text-xs text-zinc-500">{hint}</p>
       </div>
     );
   }

@@ -6,10 +6,11 @@ import { getAllUserMedia, getUserMedia } from "@/lib/instagram/provider";
 import { createInstagramContext } from "@/lib/instagram/provider";
 import type { InstagramContext } from "@/lib/instagram/context";
 import { decryptToken, encryptToken } from "@/lib/meta/oauth";
+import { syncInstagramAccountFromFacebookPage } from "@/lib/instagram/sync-from-facebook-page";
 import {
   brandNameMatches,
   canReadInstagramMedia,
-  fetchInstagramLinkedToFacebookPage,
+  listLiveInstagramLinks,
   rematchInstagramByUsername,
   resolveInstagramMediaAccessToken,
 } from "@/lib/meta/page-token";
@@ -39,6 +40,7 @@ async function repairFromWorkspaceFacebookPages(opts: {
   accountId: string;
   username: string;
   workspaceId: string;
+  diagnostics: Array<Record<string, unknown>>;
 }): Promise<{
   instagramId: string;
   accessToken: string;
@@ -47,6 +49,15 @@ async function repairFromWorkspaceFacebookPages(opts: {
     where: { workspaceId: opts.workspaceId },
     select: { id: true, pageId: true, name: true, accessToken: true },
   });
+  opts.diagnostics.push({
+    step: "workspace_facebook_pages",
+    pages: pages.map((p) => ({
+      name: p.name,
+      pageId: p.pageId,
+      matchesUsername: brandNameMatches(p.name, opts.username),
+    })),
+  });
+
   const candidates = pages.filter(
     (page) =>
       brandNameMatches(page.name, opts.username) ||
@@ -63,34 +74,35 @@ async function repairFromWorkspaceFacebookPages(opts: {
     let pageToken: string;
     try {
       pageToken = decryptToken(page.accessToken);
-    } catch {
+    } catch (error) {
+      opts.diagnostics.push({
+        step: "decrypt_page_token",
+        page: page.name,
+        error: error instanceof Error ? error.message : String(error),
+      });
       continue;
     }
-    const linked = await fetchInstagramLinkedToFacebookPage({
+    const synced = await syncInstagramAccountFromFacebookPage({
+      workspaceId: opts.workspaceId,
       pageId: page.pageId,
+      pageName: page.name,
       pageAccessToken: pageToken,
     });
-    if (!linked) continue;
-    if (
-      linked.username &&
-      !brandNameMatches(linked.username, opts.username) &&
-      !brandNameMatches(opts.username, linked.username)
-    ) {
-      // Prefer username match; still allow if page name already matched.
-      if (!candidates.some((c) => c.id === page.id)) continue;
-    }
-    await prisma.instagramAccount.update({
-      where: { id: opts.accountId },
-      data: {
-        instagramId: linked.instagramId,
-        accessToken: encryptToken(linked.pageAccessToken),
-        tokenExpiresAt: new Date(Date.now() + 60 * 24 * 60 * 60 * 1000),
-        ...(linked.username ? { username: linked.username } : {}),
-      },
+    opts.diagnostics.push({
+      step: "sync_from_facebook_page",
+      page: page.name,
+      synced,
     });
+    if (!synced) continue;
+    if (
+      synced.accountId !== opts.accountId &&
+      !brandNameMatches(synced.username, opts.username)
+    ) {
+      continue;
+    }
     return {
-      instagramId: linked.instagramId,
-      accessToken: linked.pageAccessToken,
+      instagramId: synced.instagramId,
+      accessToken: pageToken,
     };
   }
   return null;
@@ -121,6 +133,15 @@ export async function GET(request: NextRequest) {
     );
   }
 
+  const diagnostics: Array<Record<string, unknown>> = [
+    {
+      step: "start",
+      accountId: account.id,
+      username: account.username,
+      storedInstagramId: account.instagramId,
+    },
+  ];
+
   try {
     let context = await createInstagramContext(account);
     let tokenRefreshed = false;
@@ -136,8 +157,27 @@ export async function GET(request: NextRequest) {
         resolved.accessToken,
         context.instagramId
       );
+      diagnostics.push({
+        step: "probe_stored",
+        canRead: readable,
+        tokenRefreshedFromResolve: resolved.refreshed,
+      });
 
       if (!readable) {
+        const live = await listLiveInstagramLinks(null).catch((error) => {
+          diagnostics.push({
+            step: "list_live_links",
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return [];
+        });
+        diagnostics.push({
+          step: "list_live_links",
+          count: live.length,
+          usernames: live.map((l) => l.username),
+          seesHamakala: live.some((l) => brandNameMatches(l.username, "hamakala")),
+        });
+
         // 1) Rematch via System User /me/accounts (never with Page token).
         const match = await rematchInstagramByUsername({
           username: account.username,
@@ -146,7 +186,22 @@ export async function GET(request: NextRequest) {
             "[Instagram Posts] rematch failed:",
             error instanceof Error ? error.message : error
           );
+          diagnostics.push({
+            step: "rematch_username",
+            error: error instanceof Error ? error.message : String(error),
+          });
           return null;
+        });
+        diagnostics.push({
+          step: "rematch_username",
+          found: Boolean(match),
+          match: match
+            ? {
+                username: match.username,
+                instagramId: match.instagramId,
+                pageName: match.pageName,
+              }
+            : null,
         });
 
         if (match && match.instagramId !== account.instagramId) {
@@ -178,6 +233,7 @@ export async function GET(request: NextRequest) {
             accountId: account.id,
             username: account.username,
             workspaceId,
+            diagnostics,
           });
           if (fromFb) {
             console.warn(
@@ -245,6 +301,7 @@ export async function GET(request: NextRequest) {
         accountId: account.id,
         username: account.username,
         workspaceId,
+        diagnostics,
       });
       if (!fromFb) throw error;
       context = {
@@ -264,6 +321,7 @@ export async function GET(request: NextRequest) {
       tokenRefreshed,
       idRepaired,
       instagramId: context.provider === "META" ? context.instagramId : account.instagramId,
+      diagnostics,
       limitations:
         account.provider === "ZERNIO"
           ? ["Zernio returns the 25 most recent Instagram posts."]
@@ -274,14 +332,42 @@ export async function GET(request: NextRequest) {
             : [],
     });
   } catch (err) {
-    console.error("[Instagram Posts] Error:", err);
+    console.error("[Instagram Posts] Error:", err, { diagnostics });
     const message =
       err instanceof Error ? err.message : "Failed to fetch Instagram posts";
-    const cleaned = /nonexisting field \(accounts\)/i.test(message)
-      ? `Could not load Instagram posts for @${account.username}. Re-connect همه کالا in Settings (paste System User token, then select the Page + Instagram).`
-      : isDeadInstagramObjectError(err)
-        ? `${message} Instagram id for @${account.username} is stale. Re-connect that account in Settings.`
+    const seesHamakalaOnSystemUser = diagnostics.some(
+      (d) => d.step === "list_live_links" && d.seesHamakala === true
+    );
+    const hasHamakalaFacebook = diagnostics.some(
+      (d) =>
+        d.step === "workspace_facebook_pages" &&
+        Array.isArray(d.pages) &&
+        (d.pages as Array<{ matchesUsername?: boolean; name?: string }>).some(
+          (p) =>
+            p.matchesUsername ||
+            brandNameMatches(String(p.name ?? ""), "hamakala") ||
+            brandNameMatches(String(p.name ?? ""), "همه کالا")
+        )
+    );
+    const cleaned = isDeadInstagramObjectError(err)
+      ? [
+          `Instagram id for @${account.username} is stale (${account.instagramId}).`,
+          !seesHamakalaOnSystemUser
+            ? "META_SYSTEM_USER_TOKEN cannot see همه کالا / @hamakala.af right now."
+            : null,
+          !hasHamakalaFacebook
+            ? "No matching Facebook Page is connected in this workspace."
+            : "A matching Facebook Page exists but IG sync did not return a live id.",
+          "Fix: Meta Business Suite → assign Page «همه کالا» to the System User → new token → Settings → Connect Facebook (Instagram syncs automatically). Or paste the همه کالا Page access token in Settings.",
+        ]
+          .filter(Boolean)
+          .join(" ")
+      : /nonexisting field \(accounts\)/i.test(message)
+        ? `Could not load Instagram posts for @${account.username}. Re-connect همه کالا via Facebook Page token in Settings.`
         : message;
-    return NextResponse.json({ success: false, error: cleaned }, { status: 500 });
+    return NextResponse.json(
+      { success: false, error: cleaned, diagnostics },
+      { status: 500 }
+    );
   }
 }
