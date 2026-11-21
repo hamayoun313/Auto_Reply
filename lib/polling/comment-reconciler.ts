@@ -49,10 +49,11 @@ import {
 // fresh Railway deploys), poll is the only path — 6h was too short and missed
 // real keyword comments on older posts in the recent feed.
 const LOOKBACK_HOURS = Number(process.env.COMMENT_POLL_LOOKBACK_HOURS ?? 48);
-// Prefer a short specific-post window for steady-state polling. Deep backlog
-// should come from webhooks + PENDING requeue, not re-reading days of comments.
+// Specific-post campaigns need a deeper window: users often expect replies to
+// keyword comments from several days ago (e.g. azizi_official20 "7" ~2d old).
+// Override with COMMENT_POLL_SPECIFIC_LOOKBACK_HOURS if needed.
 const SPECIFIC_POST_LOOKBACK_HOURS = Number(
-  process.env.COMMENT_POLL_SPECIFIC_LOOKBACK_HOURS ?? 48
+  process.env.COMMENT_POLL_SPECIFIC_LOOKBACK_HOURS ?? 168
 );
 // Hard cap across the whole campaign per sweep (not per media).
 const MAX_NEW_PER_SWEEP = Number(process.env.COMMENT_POLL_MAX_PER_SWEEP ?? 5);
