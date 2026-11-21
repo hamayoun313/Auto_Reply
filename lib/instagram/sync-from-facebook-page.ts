@@ -79,15 +79,17 @@ export async function syncInstagramAccountFromFacebookPageDetailed(opts: {
 
   if (target) {
     const previousInstagramId = target.instagramId;
+    // instagramId is unique: if another row already holds the live id, refresh
+    // that row instead of moving the id onto the stale target (P2002).
+    // Must run even when targetAccountId is set — posts repair previously
+    // skipped this and crashed with Unique constraint failed.
     if (
       previousInstagramId !== linked.instagramId &&
       byExactId &&
-      byUsername &&
-      byExactId.id !== byUsername.id &&
-      !opts.targetAccountId
+      byExactId.id !== target.id
     ) {
       console.warn(
-        `[IG Sync] @${username}: stale row ${byUsername.id} (${previousInstagramId}) vs live row ${byExactId.id}; refreshing live row`
+        `[IG Sync] @${username}: stale row ${target.id} (${previousInstagramId}) vs live row ${byExactId.id}; refreshing live row`
       );
       await prisma.instagramAccount.update({
         where: { id: byExactId.id },
@@ -102,7 +104,7 @@ export async function syncInstagramAccountFromFacebookPageDetailed(opts: {
           accountId: byExactId.id,
           username,
           instagramId: linked.instagramId,
-          previousInstagramId: byUsername.instagramId,
+          previousInstagramId,
           created: false,
           source: linked.source,
         },
