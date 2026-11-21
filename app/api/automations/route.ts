@@ -102,10 +102,10 @@ const createAutomationSchema = z
   .refine(
     (d) =>
       d.channel !== "facebook" ||
-      (!d.pendingNextReel && !d.requireFollow && !d.openingDmEnabled && !d.dmTriggerEnabled),
+      (!d.requireFollow && !d.openingDmEnabled && !d.dmTriggerEnabled),
     {
       message:
-        "Facebook campaigns support comment→Messenger only (no next-reel, follow gate, opening DM, or DM trigger yet)",
+        "Facebook campaigns support comment→Messenger (no follow gate, opening DM, or DM trigger yet)",
       path: ["channel"],
     }
   );
@@ -459,7 +459,7 @@ export async function POST(request: NextRequest) {
         postId: isSpecificPost ? parsed.data.postId : null,
         postIds: isSpecificPost ? parsed.data.postIds ?? [] : [],
         postUrl: isSpecificPost ? parsed.data.postUrl : null,
-        pendingNextReel: channel === "facebook" ? false : pendingNextReel,
+        pendingNextReel,
         matchAnyPost,
         keywords: matchAnyWord ? [] : parsed.data.keywords,
         matchAnyWord,

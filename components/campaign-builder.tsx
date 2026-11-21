@@ -563,7 +563,6 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
       setOpeningDmEnabled(false);
       setRequireFollow(false);
       setDmTriggerEnabled(false);
-      if (triggerScope === "next") setTriggerScope("specific");
     } else {
       setChannel("instagram");
       setSelectedAccountId(option.id);
@@ -698,14 +697,13 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
       setOpeningDmEnabled(false);
       setRequireFollow(false);
       setDmTriggerEnabled(false);
-      if (triggerScope === "next") setTriggerScope("specific");
+      // Next-post on "both" creates one waiting campaign per channel.
     } else if (brand.facebookPageId) {
       setChannelFilter("facebook");
       setChannel("facebook");
       setOpeningDmEnabled(false);
       setRequireFollow(false);
       setDmTriggerEnabled(false);
-      if (triggerScope === "next") setTriggerScope("specific");
     } else if (brand.instagramAccountId) {
       setChannelFilter("instagram");
       setChannel("instagram");
@@ -744,7 +742,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
       postIds: split.postIds,
       postUrl: primaryUrl,
       matchAnyPost: triggerScope === "any",
-      pendingNextReel: isFacebook ? false : triggerScope === "next",
+      pendingNextReel: triggerScope === "next",
       matchAnyWord: matchMode === "any",
       keywords: matchMode === "any" ? [] : keywords,
       wholeWordMatch,
@@ -829,8 +827,6 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
         return setError(t("Pick a Facebook post."));
       if (triggerScope === "specific" && instagramPostIds.length === 0)
         return setError(t("Pick an Instagram post or reel."));
-      if (triggerScope === "next")
-        return setError(t("Next-post targeting is Instagram-only. Use specific or any."));
     } else {
       if (channel === "instagram" && !selectedAccountId)
         return setError(t("Connect an Instagram account first."));
@@ -842,8 +838,6 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
             ? "Pick a Facebook post to trigger the campaign."
             : t("Pick a post or reel to trigger the campaign.")
         );
-      if (channel === "facebook" && triggerScope === "next")
-        return setError("Next-post targeting is Instagram-only.");
     }
     if (matchMode === "specific" && keywords.length === 0)
       return setError(t("Add at least one keyword, or switch to any word."));
@@ -1123,18 +1117,15 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                     clearPostPicks();
                     if (value === "instagram") {
                       setChannel("instagram");
-                      // Keep "next" when switching to Instagram — it is IG-only.
                     } else if (value === "facebook") {
                       setChannel("facebook");
                       setOpeningDmEnabled(false);
                       setRequireFollow(false);
                       setDmTriggerEnabled(false);
-                      if (triggerScope === "next") setTriggerScope("specific");
                     } else {
                       setOpeningDmEnabled(false);
                       setRequireFollow(false);
                       setDmTriggerEnabled(false);
-                      if (triggerScope === "next") setTriggerScope("specific");
                       if (selectedFacebookPageId) {
                         pairInstagramForFacebook(selectedFacebookPageId);
                       } else if (selectedAccountId) {
@@ -1350,27 +1341,31 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
               )}
             </p>
           ) : null}
-          {!bothChannels && channel === "instagram" ? (
-            <Radio
-              checked={triggerScope === "next"}
-              onSelect={() => setTriggerScope("next")}
-            >
-              {t("next post or reel")}
-            </Radio>
-          ) : (
-            <button
-              type="button"
-              disabled
-              className="flex w-full cursor-not-allowed items-center gap-3 rounded-lg border border-border px-3 py-2.5 text-left text-sm opacity-50"
-              title={t("Next-post targeting is Instagram-only. Use specific or any.")}
-            >
-              <span className="grid h-4 w-4 shrink-0 place-items-center rounded-full border border-zinc-500" />
-              <span className="flex-1 text-muted">
-                {t("next post or reel")}{" "}
-                <span className="text-xs">({t("Instagram only")})</span>
-              </span>
-            </button>
-          )}
+          <Radio
+            checked={triggerScope === "next"}
+            onSelect={() => setTriggerScope("next")}
+          >
+            {channel === "facebook"
+              ? t("next Facebook post or reel")
+              : bothChannels
+                ? t("next post or reel on both channels")
+                : t("next post or reel")}
+          </Radio>
+          {triggerScope === "next" ? (
+            <p className="text-xs text-muted px-1">
+              {channel === "facebook"
+                ? t(
+                    "Waits for the next post or reel on this Facebook Page after you save, then starts matching comments."
+                  )
+                : bothChannels
+                  ? t(
+                      "Creates a waiting campaign for each channel. Each binds to the next post/reel published after save."
+                    )
+                  : t(
+                      "Waits for your next Instagram reel after you save, then starts matching comments."
+                    )}
+            </p>
+          ) : null}
         </Section>
 
         <Section title={t("And this comment has")}>
