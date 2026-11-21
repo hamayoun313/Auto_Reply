@@ -56,7 +56,7 @@ const SPECIFIC_POST_LOOKBACK_HOURS = Number(
   process.env.COMMENT_POLL_SPECIFIC_LOOKBACK_HOURS ?? 168
 );
 // Hard cap across the whole campaign per sweep (not per media).
-const MAX_NEW_PER_SWEEP = Number(process.env.COMMENT_POLL_MAX_PER_SWEEP ?? 5);
+const MAX_NEW_PER_SWEEP = Number(process.env.COMMENT_POLL_MAX_PER_SWEEP ?? 15);
 // For "any post" campaigns, how many recent posts to scan. Topsii-style
 // accounts post often; 3 left keyword comments on older tiles invisible.
 const RECENT_MEDIA_LIMIT = Number(process.env.COMMENT_POLL_MEDIA_LIMIT ?? 15);
@@ -191,15 +191,20 @@ export async function reconcileComments(): Promise<void> {
  */
 export async function requeueOrphanedPendingComments(): Promise<number> {
   const circuit = await getAppRateLimitState();
-  if (circuit.limited) return 0;
+  if (circuit.limited) {
+    console.log(
+      `[Comment Poll] Pending requeue skipped — Meta circuit open for ${Math.ceil(circuit.remainingMs / 60_000)} more min`
+    );
+    return 0;
+  }
 
   const queue = getDMQueue();
   const counts = await queue.getJobCounts("waiting", "active", "delayed");
-  const inflight =
-    (counts.waiting ?? 0) + (counts.active ?? 0) + (counts.delayed ?? 0);
-  // Never stack on top of live jobs. A previous "ignore inflight" switch
-  // flooded the queue with duplicate process-comment jobs.
-  if (inflight > 0) return 0;
+  // Delayed rate-limit retries must NOT block draining DB PENDING — that left
+  // 200+ ready rows stranded while delayed>0 for hours.
+  const live =
+    (counts.waiting ?? 0) + (counts.active ?? 0);
+  if (live > 0) return 0;
 
   // Debounce: after a successful requeue, wait before adding another batch.
   const redis = getRedisConnection();
@@ -222,10 +227,7 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
       status: "PENDING",
       dmDeliveryUnconfirmed: false,
       attempts: { lt: MAX_COMMENT_SEND_ATTEMPTS },
-      automation: {
-        isActive: true,
-        instagramAccountId: { not: null },
-      },
+      automation: { isActive: true },
     },
     orderBy: { createdAt: "asc" },
     take: MAX_NEW_PER_SWEEP,
@@ -241,6 +243,9 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
           instagramAccount: {
             select: { id: true, instagramId: true },
           },
+          facebookPage: {
+            select: { id: true, pageId: true },
+          },
         },
       },
     },
@@ -255,13 +260,39 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
       row.automation.postIds?.find((id) => id?.trim())?.trim() ||
       "";
     if (!mediaId) continue;
-    const account = row.automation.instagramAccount;
-    if (!account) continue;
+
+    const ig = row.automation.instagramAccount;
+    const fb = row.automation.facebookPage;
+
+    if (fb?.pageId) {
+      await queue.add(
+        "process-comment",
+        {
+          channel: "facebook",
+          facebookPageId: fb.pageId,
+          accountConnectionId: fb.id,
+          commentId: row.commentId,
+          commentText: row.commentText,
+          commenterId: row.commenterId,
+          commenterName: row.commenterName ?? undefined,
+          mediaId,
+          source: "POLLING",
+        },
+        {
+          delay: enqueued * Math.max(0, pacingMs),
+          jobId: `fb_pending_${fb.pageId}_${row.commentId}`,
+        }
+      );
+      enqueued += 1;
+      continue;
+    }
+
+    if (!ig) continue;
     await queue.add(
       "process-comment",
       {
-        instagramAccountId: account.instagramId,
-        accountConnectionId: account.id,
+        instagramAccountId: ig.instagramId,
+        accountConnectionId: ig.id,
         commentId: row.commentId,
         commentText: row.commentText,
         commenterId: row.commenterId,
@@ -269,7 +300,10 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
         mediaId,
         source: "POLLING",
       },
-      { delay: enqueued * Math.max(0, pacingMs) }
+      {
+        delay: enqueued * Math.max(0, pacingMs),
+        jobId: `ig_pending_${ig.instagramId}_${row.commentId}`,
+      }
     );
     enqueued += 1;
   }
@@ -281,7 +315,7 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
     );
     await redis.set(debounceKey, "1", "EX", debounceSec);
     console.log(
-      `[Comment Poll] Requeued ${enqueued} orphaned PENDING from DB (queue was idle; debounce ${debounceSec}s)`
+      `[Comment Poll] Requeued ${enqueued} orphaned PENDING from DB (waiting=${counts.waiting ?? 0} active=${counts.active ?? 0} delayed=${counts.delayed ?? 0}; debounce ${debounceSec}s)`
     );
   }
   return enqueued;
