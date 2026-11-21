@@ -206,13 +206,13 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
   const debounceKey = "meta:pending_requeue:debounce";
   if (await redis.get(debounceKey)) return 0;
 
-  // Stale claim flags block reconciler + worker forever if the job vanished
-  // from Redis. Release claims older than one hour so they can be retried.
+  // Stale claim flags block reconciler + worker if the BullMQ job vanished.
+  // 15m (was 60m) so a crashed send does not strand hundreds of PENDING rows.
   await prisma.dmLog.updateMany({
     where: {
       status: "PENDING",
       dmDeliveryUnconfirmed: true,
-      updatedAt: { lt: new Date(Date.now() - 60 * 60_000) },
+      updatedAt: { lt: new Date(Date.now() - 15 * 60_000) },
     },
     data: { dmDeliveryUnconfirmed: false, errorMessage: null },
   });
@@ -222,7 +222,10 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
       status: "PENDING",
       dmDeliveryUnconfirmed: false,
       attempts: { lt: MAX_COMMENT_SEND_ATTEMPTS },
-      automation: { isActive: true },
+      automation: {
+        isActive: true,
+        instagramAccountId: { not: null },
+      },
     },
     orderBy: { createdAt: "asc" },
     take: MAX_NEW_PER_SWEEP,
@@ -234,6 +237,7 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
       automation: {
         select: {
           postId: true,
+          postIds: true,
           instagramAccount: {
             select: { id: true, instagramId: true },
           },
@@ -245,7 +249,11 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
   const pacingMs = Number(process.env.DM_SEND_PACING_MS ?? 30_000);
   let enqueued = 0;
   for (const row of pending) {
-    const mediaId = row.automation.postId;
+    // Multi-post campaigns often leave postId null and only set postIds[].
+    const mediaId =
+      row.automation.postId?.trim() ||
+      row.automation.postIds?.find((id) => id?.trim())?.trim() ||
+      "";
     if (!mediaId) continue;
     const account = row.automation.instagramAccount;
     if (!account) continue;
