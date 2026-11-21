@@ -2,7 +2,8 @@ import { prisma } from "@/lib/db/client";
 import { encryptToken } from "@/lib/meta/oauth";
 import {
   brandNameMatches,
-  fetchInstagramLinkedToFacebookPage,
+  fetchInstagramLinkedToFacebookPageDetailed,
+  type FacebookPageIgLookupResult,
 } from "@/lib/meta/page-token";
 
 export type SyncedInstagramFromPage = {
@@ -11,6 +12,12 @@ export type SyncedInstagramFromPage = {
   instagramId: string;
   previousInstagramId: string | null;
   created: boolean;
+  source: string;
+};
+
+export type SyncInstagramFromPageResult = {
+  synced: SyncedInstagramFromPage | null;
+  lookup: FacebookPageIgLookupResult;
 };
 
 /**
@@ -23,16 +30,31 @@ export async function syncInstagramAccountFromFacebookPage(opts: {
   pageId: string;
   pageName: string;
   pageAccessToken: string;
+  /** When set, only update this account row (never create/overwrite others). */
+  targetAccountId?: string;
 }): Promise<SyncedInstagramFromPage | null> {
-  const linked = await fetchInstagramLinkedToFacebookPage({
+  const result = await syncInstagramAccountFromFacebookPageDetailed(opts);
+  return result.synced;
+}
+
+export async function syncInstagramAccountFromFacebookPageDetailed(opts: {
+  workspaceId: string;
+  pageId: string;
+  pageName: string;
+  pageAccessToken: string;
+  targetAccountId?: string;
+}): Promise<SyncInstagramFromPageResult> {
+  const lookup = await fetchInstagramLinkedToFacebookPageDetailed({
     pageId: opts.pageId,
     pageAccessToken: opts.pageAccessToken,
   });
+  const linked = lookup.linked;
   if (!linked?.instagramId) {
     console.warn(
-      `[IG Sync] No instagram_business_account on FB Page ${opts.pageName} (${opts.pageId})`
+      `[IG Sync] No Instagram linked on FB Page ${opts.pageName} (${opts.pageId}) tokenKind=${lookup.tokenKind}`,
+      lookup.probes
     );
-    return null;
+    return { synced: null, lookup };
   }
 
   const username = (linked.username ?? opts.pageName).replace(/^@/, "");
@@ -50,16 +72,19 @@ export async function syncInstagramAccountFromFacebookPage(opts: {
   const byUsername = workspaceAccounts.find((a) =>
     brandNameMatches(a.username, username)
   );
-  const target = byExactId ?? byUsername ?? null;
+  const byTarget = opts.targetAccountId
+    ? workspaceAccounts.find((a) => a.id === opts.targetAccountId)
+    : null;
+  const target = byTarget ?? byExactId ?? byUsername ?? null;
 
   if (target) {
     const previousInstagramId = target.instagramId;
-    // If another row already owns the correct id, update that row's token instead.
     if (
       previousInstagramId !== linked.instagramId &&
       byExactId &&
       byUsername &&
-      byExactId.id !== byUsername.id
+      byExactId.id !== byUsername.id &&
+      !opts.targetAccountId
     ) {
       console.warn(
         `[IG Sync] @${username}: stale row ${byUsername.id} (${previousInstagramId}) vs live row ${byExactId.id}; refreshing live row`
@@ -73,16 +98,20 @@ export async function syncInstagramAccountFromFacebookPage(opts: {
         },
       });
       return {
-        accountId: byExactId.id,
-        username,
-        instagramId: linked.instagramId,
-        previousInstagramId: byUsername.instagramId,
-        created: false,
+        synced: {
+          accountId: byExactId.id,
+          username,
+          instagramId: linked.instagramId,
+          previousInstagramId: byUsername.instagramId,
+          created: false,
+          source: linked.source,
+        },
+        lookup,
       };
     }
 
     console.info(
-      `[IG Sync] Updating @${username}: ${previousInstagramId} → ${linked.instagramId}`
+      `[IG Sync] Updating @${username}: ${previousInstagramId} → ${linked.instagramId} via ${linked.source}`
     );
     await prisma.instagramAccount.update({
       where: { id: target.id },
@@ -94,12 +123,20 @@ export async function syncInstagramAccountFromFacebookPage(opts: {
       },
     });
     return {
-      accountId: target.id,
-      username,
-      instagramId: linked.instagramId,
-      previousInstagramId,
-      created: false,
+      synced: {
+        accountId: target.id,
+        username,
+        instagramId: linked.instagramId,
+        previousInstagramId,
+        created: false,
+        source: linked.source,
+      },
+      lookup,
     };
+  }
+
+  if (opts.targetAccountId) {
+    return { synced: null, lookup };
   }
 
   console.info(
@@ -118,10 +155,14 @@ export async function syncInstagramAccountFromFacebookPage(opts: {
     },
   });
   return {
-    accountId: created.id,
-    username,
-    instagramId: linked.instagramId,
-    previousInstagramId: null,
-    created: true,
+    synced: {
+      accountId: created.id,
+      username,
+      instagramId: linked.instagramId,
+      previousInstagramId: null,
+      created: true,
+      source: linked.source,
+    },
+    lookup,
   };
 }

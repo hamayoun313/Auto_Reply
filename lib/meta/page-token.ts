@@ -266,28 +266,95 @@ export async function rematchInstagramByUsername(opts: {
   const links = await listLiveInstagramLinks(null);
   return (
     links.find((l) => l.username.toLowerCase() === needle) ??
-    links.find(
-      (l) =>
-        l.username.toLowerCase().includes(needle) ||
-        needle.includes(l.username.toLowerCase())
-    ) ??
+    links.find((l) => brandNameMatches(l.username, needle)) ??
     null
   );
 }
 
-/**
- * Read Instagram business account linked to a Facebook Page using a Page token.
- * This works even when the Page is not visible on System User /me/accounts.
- */
-export async function fetchInstagramLinkedToFacebookPage(opts: {
-  pageId: string;
-  pageAccessToken: string;
-}): Promise<{
+export type FacebookPageIgLookup = {
   instagramId: string;
   username?: string;
   pageAccessToken: string;
   pageId: string;
-} | null> {
+  source: string;
+};
+
+export type FacebookPageIgLookupResult = {
+  linked: FacebookPageIgLookup | null;
+  /** Safe Graph diagnostics for UI / logs (no tokens). */
+  probes: Array<Record<string, unknown>>;
+  tokenKind: "page" | "system_user_or_user" | "unknown";
+};
+
+/**
+ * Inspect what kind of token we have. Page tokens cannot call /me/accounts
+ * (Meta returns nonexisting field accounts). Do not use listPagesWithAccessTokens
+ * here — it swallows that error into [].
+ */
+export async function inspectTokenKind(
+  accessToken: string
+): Promise<"page" | "system_user_or_user" | "unknown"> {
+  try {
+    const url = new URL(`${facebookGraphBase()}/me/accounts`);
+    url.searchParams.set("fields", "id");
+    url.searchParams.set("limit", "1");
+    url.searchParams.set("access_token", accessToken);
+    await graphGet(url);
+    return "system_user_or_user";
+  } catch (error) {
+    if (isMissingAccountsFieldError(error)) return "page";
+  }
+  try {
+    const me = new URL(`${facebookGraphBase()}/me`);
+    me.searchParams.set("fields", "id,name");
+    me.searchParams.set("access_token", accessToken);
+    await graphGet(me);
+    // /me works for Page tokens too (returns the Page). Reaching here means
+    // /me/accounts failed for a non-accounts-field reason.
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * Read Instagram business account linked to a Facebook Page using a Page token.
+ * Tries several Graph shapes because Meta returns IG under different fields
+ * depending on Page experience / permissions.
+ */
+export async function fetchInstagramLinkedToFacebookPage(opts: {
+  pageId: string;
+  pageAccessToken: string;
+}): Promise<FacebookPageIgLookup | null> {
+  const result = await fetchInstagramLinkedToFacebookPageDetailed(opts);
+  return result.linked;
+}
+
+export async function fetchInstagramLinkedToFacebookPageDetailed(opts: {
+  pageId: string;
+  pageAccessToken: string;
+}): Promise<FacebookPageIgLookupResult> {
+  const probes: Array<Record<string, unknown>> = [];
+  const tokenKind = await inspectTokenKind(opts.pageAccessToken);
+  probes.push({ step: "token_kind", tokenKind, pageId: opts.pageId });
+
+  const tryParseIg = (
+    source: string,
+    ig?: { id?: string; username?: string } | null,
+    pageId?: string
+  ): FacebookPageIgLookup | null => {
+    const igId = ig?.id?.trim();
+    if (!igId) return null;
+    return {
+      instagramId: igId,
+      username: ig?.username,
+      pageAccessToken: opts.pageAccessToken,
+      pageId: pageId ?? opts.pageId,
+      source,
+    };
+  };
+
+  // 1) Classic Page field
   try {
     const url = new URL(`${facebookGraphBase()}/${opts.pageId}`);
     url.searchParams.set(
@@ -300,21 +367,99 @@ export async function fetchInstagramLinkedToFacebookPage(opts: {
       name?: string;
       instagram_business_account?: { id?: string; username?: string };
     }>(url);
-    const igId = page.instagram_business_account?.id?.trim();
-    if (!igId) return null;
-    return {
-      instagramId: igId,
-      username: page.instagram_business_account?.username,
-      pageAccessToken: opts.pageAccessToken,
-      pageId: page.id ?? opts.pageId,
-    };
-  } catch (error) {
-    console.warn(
-      "[Meta] fetchInstagramLinkedToFacebookPage failed:",
-      error instanceof Error ? error.message : error
+    probes.push({
+      step: "instagram_business_account",
+      ok: true,
+      pageGraphId: page.id,
+      pageName: page.name,
+      hasIg: Boolean(page.instagram_business_account?.id),
+      igId: page.instagram_business_account?.id ?? null,
+      igUsername: page.instagram_business_account?.username ?? null,
+    });
+    const linked = tryParseIg(
+      "instagram_business_account",
+      page.instagram_business_account,
+      page.id
     );
-    return null;
+    if (linked) return { linked, probes, tokenKind };
+  } catch (error) {
+    probes.push({
+      step: "instagram_business_account",
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
   }
+
+  // 2) Page-backed IG accounts edge (common for New Pages Experience)
+  try {
+    const url = new URL(
+      `${facebookGraphBase()}/${opts.pageId}/page_backed_instagram_accounts`
+    );
+    url.searchParams.set("fields", "id,username,name");
+    url.searchParams.set("access_token", opts.pageAccessToken);
+    const data = await graphGet<{
+      data?: Array<{ id?: string; username?: string }>;
+    }>(url);
+    const first = data.data?.[0];
+    probes.push({
+      step: "page_backed_instagram_accounts",
+      ok: true,
+      count: data.data?.length ?? 0,
+      firstId: first?.id ?? null,
+      firstUsername: first?.username ?? null,
+    });
+    const linked = tryParseIg("page_backed_instagram_accounts", first);
+    if (linked) return { linked, probes, tokenKind };
+  } catch (error) {
+    probes.push({
+      step: "page_backed_instagram_accounts",
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  // 3) connected_instagram_account
+  try {
+    const url = new URL(`${facebookGraphBase()}/${opts.pageId}`);
+    url.searchParams.set(
+      "fields",
+      "id,name,connected_instagram_account{id,username}"
+    );
+    url.searchParams.set("access_token", opts.pageAccessToken);
+    const page = await graphGet<{
+      id?: string;
+      connected_instagram_account?: { id?: string; username?: string };
+    }>(url);
+    probes.push({
+      step: "connected_instagram_account",
+      ok: true,
+      hasIg: Boolean(page.connected_instagram_account?.id),
+      igId: page.connected_instagram_account?.id ?? null,
+    });
+    const linked = tryParseIg(
+      "connected_instagram_account",
+      page.connected_instagram_account,
+      page.id
+    );
+    if (linked) return { linked, probes, tokenKind };
+  } catch (error) {
+    probes.push({
+      step: "connected_instagram_account",
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  // 4) If token looks like System User, explain why Page IG lookup fails.
+  if (tokenKind === "system_user_or_user") {
+    probes.push({
+      step: "diagnosis",
+      issue:
+        "Stored token behaves like System User/User token, not a Page token. System User cannot read همه کالا unless that Page is assigned. Re-paste the همه کالا Page access token in Settings.",
+    });
+  }
+
+  return { linked: null, probes, tokenKind };
 }
 
 export function brandNameMatches(a: string, b: string): boolean {

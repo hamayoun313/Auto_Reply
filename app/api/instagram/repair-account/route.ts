@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCurrentWorkspaceId } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
-import { syncInstagramAccountFromFacebookPage } from "@/lib/instagram/sync-from-facebook-page";
-import { decryptToken } from "@/lib/meta/oauth";
+import { syncInstagramAccountFromFacebookPageDetailed } from "@/lib/instagram/sync-from-facebook-page";
+import { decryptToken, encryptToken } from "@/lib/meta/oauth";
 import {
   brandNameMatches,
   canReadInstagramMedia,
+  inspectTokenKind,
   listLiveInstagramLinks,
   rematchInstagramByUsername,
 } from "@/lib/meta/page-token";
@@ -16,6 +17,14 @@ import {
 } from "@/lib/workspace-access";
 
 export const runtime = "nodejs";
+
+function isHamakalaName(name: string): boolean {
+  return (
+    brandNameMatches(name, "hamakala") ||
+    brandNameMatches(name, "همه کالا") ||
+    brandNameMatches(name, "همه‌کالا")
+  );
+}
 
 /**
  * Diagnose + repair a stale Instagram business id (Graph #100/33).
@@ -48,7 +57,10 @@ export async function POST(request: NextRequest) {
       ? await prisma.instagramAccount.findFirst({
           where: {
             workspaceId,
-            username: { equals: body.username.replace(/^@/, ""), mode: "insensitive" },
+            username: {
+              equals: body.username.replace(/^@/, ""),
+              mode: "insensitive",
+            },
           },
         })
       : await prisma.instagramAccount.findFirst({
@@ -74,13 +86,15 @@ export async function POST(request: NextRequest) {
 
   const steps: Array<Record<string, unknown>> = [];
   let tokenOk = false;
+  let storedToken: string | null = null;
   try {
-    const stored = decryptToken(account.accessToken);
-    tokenOk = await canReadInstagramMedia(stored, account.instagramId);
+    storedToken = decryptToken(account.accessToken);
+    tokenOk = await canReadInstagramMedia(storedToken, account.instagramId);
     steps.push({
       step: "probe_stored",
       instagramId: account.instagramId,
       canRead: tokenOk,
+      tokenKind: await inspectTokenKind(storedToken).catch(() => "unknown"),
     });
   } catch (error) {
     steps.push({
@@ -138,29 +152,38 @@ export async function POST(request: NextRequest) {
   });
 
   if (rematch) {
-    const updated = await prisma.instagramAccount.update({
-      where: { id: account.id },
-      data: {
-        instagramId: rematch.instagramId,
-        accessToken: (await import("@/lib/meta/oauth")).encryptToken(
-          rematch.pageAccessToken
-        ),
-        tokenExpiresAt: new Date(Date.now() + 60 * 24 * 60 * 60 * 1000),
-        username: rematch.username,
-      },
+    const mediaOk = await canReadInstagramMedia(
+      rematch.pageAccessToken,
+      rematch.instagramId
+    );
+    steps.push({
+      step: "verify_rematch_media",
+      canRead: mediaOk,
+      instagramId: rematch.instagramId,
     });
-    return NextResponse.json({
-      success: true,
-      repaired: true,
-      via: "system_user",
-      account: {
-        id: updated.id,
-        username: updated.username,
-        instagramId: updated.instagramId,
-        previousInstagramId: account.instagramId,
-      },
-      steps,
-    });
+    if (mediaOk) {
+      const updated = await prisma.instagramAccount.update({
+        where: { id: account.id },
+        data: {
+          instagramId: rematch.instagramId,
+          accessToken: encryptToken(rematch.pageAccessToken),
+          tokenExpiresAt: new Date(Date.now() + 60 * 24 * 60 * 60 * 1000),
+          username: rematch.username,
+        },
+      });
+      return NextResponse.json({
+        success: true,
+        repaired: true,
+        via: "system_user",
+        account: {
+          id: updated.id,
+          username: updated.username,
+          instagramId: updated.instagramId,
+          previousInstagramId: account.instagramId,
+        },
+        steps,
+      });
+    }
   }
 
   const pages = await prisma.facebookPage.findMany({
@@ -173,14 +196,14 @@ export async function POST(request: NextRequest) {
       name: p.name,
       pageId: p.pageId,
       nameMatch: brandNameMatches(p.name, account.username),
+      matchesHamakala: isHamakalaName(p.name),
     })),
   });
 
   for (const page of pages) {
     if (
       !brandNameMatches(page.name, account.username) &&
-      !brandNameMatches(page.name, "hamakala") &&
-      !brandNameMatches(page.name, "همه کالا")
+      !isHamakalaName(page.name)
     ) {
       continue;
     }
@@ -195,18 +218,72 @@ export async function POST(request: NextRequest) {
       });
       continue;
     }
-    const synced = await syncInstagramAccountFromFacebookPage({
-      workspaceId,
-      pageId: page.pageId,
-      pageName: page.name,
-      pageAccessToken: pageToken,
+
+    const tokenKind = await inspectTokenKind(pageToken);
+    steps.push({
+      step: "fb_page_token_kind",
+      page: page.name,
+      tokenKind,
     });
+
+    const storedStillWorks = await canReadInstagramMedia(
+      pageToken,
+      account.instagramId
+    );
+    steps.push({
+      step: "page_token_reads_stored_ig",
+      page: page.name,
+      canRead: storedStillWorks,
+      storedInstagramId: account.instagramId,
+    });
+    if (storedStillWorks) {
+      const updated = await prisma.instagramAccount.update({
+        where: { id: account.id },
+        data: {
+          accessToken: encryptToken(pageToken),
+          tokenExpiresAt: new Date(Date.now() + 60 * 24 * 60 * 60 * 1000),
+        },
+      });
+      return NextResponse.json({
+        success: true,
+        repaired: true,
+        via: "facebook_page_token_restore",
+        account: {
+          id: updated.id,
+          username: updated.username,
+          instagramId: updated.instagramId,
+          previousInstagramId: account.instagramId,
+        },
+        steps,
+      });
+    }
+
+    const { synced, lookup } =
+      await syncInstagramAccountFromFacebookPageDetailed({
+        workspaceId,
+        pageId: page.pageId,
+        pageName: page.name,
+        pageAccessToken: pageToken,
+        targetAccountId: account.id,
+      });
     steps.push({
       step: "sync_from_facebook_page",
       page: page.name,
+      tokenKind: lookup.tokenKind,
+      probes: lookup.probes,
       synced,
     });
     if (synced) {
+      const mediaOk = await canReadInstagramMedia(
+        pageToken,
+        synced.instagramId
+      );
+      steps.push({
+        step: "verify_synced_media",
+        canRead: mediaOk,
+        instagramId: synced.instagramId,
+      });
+      if (!mediaOk) continue;
       return NextResponse.json({
         success: true,
         repaired: true,
@@ -222,6 +299,11 @@ export async function POST(request: NextRequest) {
     }
   }
 
+  const pageTokenIsSu = steps.some(
+    (s) =>
+      s.step === "fb_page_token_kind" && s.tokenKind === "system_user_or_user"
+  );
+
   return NextResponse.json(
     {
       success: false,
@@ -233,8 +315,9 @@ export async function POST(request: NextRequest) {
         instagramId: account.instagramId,
       },
       steps,
-      message:
-        "Instagram id is stale and همه کالا is not available on META_SYSTEM_USER_TOKEN. In Meta Business Suite assign Page «همه کالا» to the System User, generate a new token, paste it in Settings → connect the Facebook Page (Instagram will sync automatically). Or paste the همه کالا Page access token directly.",
+      message: pageTokenIsSu
+        ? "Instagram id is stale and the connected همه کالا Facebook Page token behaves like System User, not a Page token. Paste the همه کالا Page access token in Settings (or assign the Page to the System User and reconnect)."
+        : "Instagram id is stale and همه کالا is not available on META_SYSTEM_USER_TOKEN. In Meta Business Suite assign Page «همه کالا» to the System User, generate a new token, paste it in Settings → connect the Facebook Page (Instagram will sync automatically). Or paste the همه کالا Page access token directly.",
       hint: {
         expectedUsername: "hamakala.af",
         staleInstagramId: account.instagramId,
@@ -243,9 +326,9 @@ export async function POST(request: NextRequest) {
         ),
         workspaceHasHamakalaFacebookPage: pages.some(
           (p) =>
-            brandNameMatches(p.name, "hamakala") ||
-            brandNameMatches(p.name, "همه کالا")
+            brandNameMatches(p.name, "hamakala") || isHamakalaName(p.name)
         ),
+        pageTokenLooksLikeSystemUser: pageTokenIsSu,
       },
     },
     { status: 422 }
