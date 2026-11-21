@@ -51,7 +51,7 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    const posts = await listFacebookPagePosts(ctx.accessToken, ctx.pageId, 40);
+    const posts = await listFacebookPagePosts(ctx.accessToken, ctx.pageId, 60);
     return NextResponse.json({
       success: true,
       data: posts.map((p) => ({
@@ -59,11 +59,20 @@ export async function GET(request: NextRequest) {
         caption: p.message ?? "",
         timestamp: p.created_time ?? null,
         permalink: p.permalink_url ?? null,
-        mediaUrl: p.full_picture ?? null,
-        mediaType: "IMAGE",
+        mediaUrl: p.full_picture ?? p.picture ?? null,
+        mediaType:
+          p.status_type === "added_video" || p.status_type === "mobile_status_update"
+            ? "VIDEO"
+            : "IMAGE",
         commentsCount: p.commentsCount ?? 0,
       })),
       page: { id: page.id, pageId: page.pageId, name: page.name },
+      limitations:
+        posts.length === 0
+          ? [
+              "No Facebook posts returned for this Page. Check Page token permissions (pages_read_engagement / pages_read_user_content) or publish a post as the Page.",
+            ]
+          : [],
     });
   } catch (err) {
     console.error("[Facebook Posts] Error:", err);

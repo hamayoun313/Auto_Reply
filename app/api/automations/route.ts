@@ -32,6 +32,7 @@ const createAutomationSchema = z
     instagramAccountId: z.string().min(1).optional().nullable(),
     facebookPageId: z.string().min(1).optional().nullable(),
     postId: z.string().min(1).optional().nullable(),
+    postIds: z.array(z.string().min(1)).max(5).optional().default([]),
     postUrl: z
       .union([z.string().url(), z.literal(""), z.null()])
       .optional()
@@ -78,7 +79,11 @@ const createAutomationSchema = z
   })
   // A campaign must target a specific post, any post, or the next reel.
   .refine(
-    (d) => d.matchAnyPost || d.pendingNextReel || Boolean(d.postId),
+    (d) =>
+      d.matchAnyPost ||
+      d.pendingNextReel ||
+      Boolean(d.postId) ||
+      (d.postIds?.length ?? 0) > 0,
     { message: "Choose which post(s) trigger the campaign", path: ["postId"] }
   )
   // And it must match either specific words or any word.
@@ -111,6 +116,7 @@ const updateAutomationSchema = z.object({
   instagramAccountId: z.string().min(1).optional().nullable(),
   facebookPageId: z.string().min(1).optional().nullable(),
   postId: z.string().min(1).optional().nullable(),
+  postIds: z.array(z.string().min(1)).max(5).optional(),
   postUrl: z.string().url().optional().nullable(),
   pendingNextReel: z.boolean().optional(),
   matchAnyPost: z.boolean().optional(),
@@ -160,16 +166,27 @@ export async function GET(request: NextRequest) {
     request.nextUrl.searchParams.get("instagramAccountId");
   const facebookPageId = request.nextUrl.searchParams.get("facebookPageId");
   const channel = request.nextUrl.searchParams.get("channel");
+  // Brand filter: when both IDs are set, return FB + IG campaigns for that brand.
   const accountFilter =
-    instagramAccountId && instagramAccountId !== "all"
-      ? { instagramAccountId }
-      : facebookPageId && facebookPageId !== "all"
-        ? { facebookPageId }
-        : channel === "facebook"
-          ? { facebookPageId: { not: null } }
-          : channel === "instagram"
-            ? { instagramAccountId: { not: null } }
-            : {};
+    instagramAccountId &&
+    instagramAccountId !== "all" &&
+    facebookPageId &&
+    facebookPageId !== "all"
+      ? {
+          OR: [
+            { instagramAccountId },
+            { facebookPageId },
+          ],
+        }
+      : instagramAccountId && instagramAccountId !== "all"
+        ? { instagramAccountId }
+        : facebookPageId && facebookPageId !== "all"
+          ? { facebookPageId }
+          : channel === "facebook"
+            ? { facebookPageId: { not: null } }
+            : channel === "instagram"
+              ? { instagramAccountId: { not: null } }
+              : {};
 
   const automations = await prisma.automation.findMany({
     where: { workspaceId, ...accountFilter },
@@ -440,6 +457,7 @@ export async function POST(request: NextRequest) {
         goal: parsed.data.goal ?? null,
         // A next-reel campaign has no post yet; the cron binds it once a reel is posted.
         postId: isSpecificPost ? parsed.data.postId : null,
+        postIds: isSpecificPost ? parsed.data.postIds ?? [] : [],
         postUrl: isSpecificPost ? parsed.data.postUrl : null,
         pendingNextReel: channel === "facebook" ? false : pendingNextReel,
         matchAnyPost,
@@ -629,6 +647,7 @@ export async function PATCH(request: NextRequest) {
   // Any-post / next-reel campaigns carry no specific post.
   if (automationData.matchAnyPost === true || automationData.pendingNextReel === true) {
     automationData.postId = null;
+    automationData.postIds = [];
     automationData.postUrl = null;
   }
   // Keep the public-reply variations list and the legacy single field in sync.

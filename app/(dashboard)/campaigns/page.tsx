@@ -10,7 +10,11 @@ import { useI18n } from "@/lib/i18n/provider";
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import AccountSelect, { type AccountOption } from "@/components/account-select";
+import AccountSelect, {
+  type AccountOption,
+  type FacebookPageOption,
+} from "@/components/account-select";
+import { parseBrandSelectValue } from "@/lib/brand-pages";
 import { readCache, writeCache } from "@/lib/client-cache";
 
 interface Campaign {
@@ -77,7 +81,8 @@ export default function CampaignsPage() {
   const router = useRouter();
   const [automations, setAutomations] = useState<Campaign[]>([]);
   const [accounts, setAccounts] = useState<AccountOption[]>([]);
-  const [selectedAccountId, setSelectedAccountId] = useState("all");
+  const [facebookPages, setFacebookPages] = useState<FacebookPageOption[]>([]);
+  const [selectedBrandKey, setSelectedBrandKey] = useState("all");
   const [loading, setLoading] = useState(true);
   // postId -> current thumbnail URL, fetched live (Instagram URLs expire, so
   // they are never stored on the campaign).
@@ -99,8 +104,12 @@ export default function CampaignsPage() {
   const fetchAutomations = useCallback(async () => {
     try {
       const params = new URLSearchParams();
-      if (selectedAccountId !== "all") {
-        params.set("instagramAccountId", selectedAccountId);
+      const brand = parseBrandSelectValue(selectedBrandKey);
+      if (brand.instagramAccountId) {
+        params.set("instagramAccountId", brand.instagramAccountId);
+      }
+      if (brand.facebookPageId) {
+        params.set("facebookPageId", brand.facebookPageId);
       }
       const res = await fetch(
         `/api/automations${params.size ? `?${params}` : ""}`,
@@ -121,13 +130,16 @@ export default function CampaignsPage() {
     } finally {
       setLoading(false);
     }
-  }, [selectedAccountId]);
+  }, [selectedBrandKey]);
 
   useEffect(() => {
     fetch("/api/dashboard/stats")
       .then((res) => res.json())
       .then((payload) => {
-        if (payload.success) setAccounts(payload.data.instagramAccounts ?? []);
+        if (payload.success) {
+          setAccounts(payload.data.instagramAccounts ?? []);
+          setFacebookPages(payload.data.facebookPages ?? []);
+        }
       })
       .catch(console.error);
   }, []);
@@ -241,9 +253,9 @@ export default function CampaignsPage() {
     return () => window.removeEventListener("keydown", onKey);
   }, [playingVideo]);
 
-  function handleAccountChange(accountId: string) {
+  function handleBrandChange(brandKey: string) {
     setLoading(true);
-    setSelectedAccountId(accountId);
+    setSelectedBrandKey(brandKey);
   }
 
   async function toggleActive(id: string, isActive: boolean) {
@@ -337,13 +349,15 @@ export default function CampaignsPage() {
           </p>
         </div>
         <div className="flex flex-wrap items-end gap-3">
-          {accounts.length > 1 && (
+          {(accounts.length > 0 || facebookPages.length > 0) &&
+          accounts.length + facebookPages.length > 1 ? (
             <AccountSelect
               accounts={accounts}
-              value={selectedAccountId}
-              onChange={handleAccountChange}
+              facebookPages={facebookPages}
+              value={selectedBrandKey}
+              onChange={handleBrandChange}
             />
-          )}
+          ) : null}
           <Link
             href="/campaigns/import"
             className="flex-1 rounded border border-border px-4 py-2 text-center text-sm font-medium text-muted hover:text-foreground sm:flex-none"

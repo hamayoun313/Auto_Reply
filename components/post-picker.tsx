@@ -5,12 +5,14 @@
 /**
  * Post Picker
  *
- * Grid of Instagram / Facebook post thumbnails, selectable.
+ * Grid of Instagram / Facebook post thumbnails.
+ * Supports single-select (legacy) or multi-select (specific posts).
  */
 
 import { useI18n } from "@/lib/i18n/provider";
 import { useEffect, useState } from "react";
 import { readCache, writeCache } from "@/lib/client-cache";
+import { MAX_SPECIFIC_POSTS } from "@/lib/automation/post-targets";
 
 const PAGE_SIZE = 60;
 
@@ -25,8 +27,19 @@ interface InstagramPost {
   timestamp: string;
 }
 
+export type PostPick = {
+  postId: string;
+  postUrl?: string;
+  thumbUrl?: string;
+  caption?: string;
+};
+
 interface PostPickerProps {
-  selectedPostId: string | null;
+  /** Legacy single selection. Ignored when `selectedPostIds` is provided. */
+  selectedPostId?: string | null;
+  /** Multi-select specific posts (preferred). */
+  selectedPostIds?: string[];
+  maxSelected?: number;
   channel?: "instagram" | "facebook";
   instagramAccountId?: string | null;
   facebookPageId?: string | null;
@@ -34,25 +47,37 @@ interface PostPickerProps {
   usedPostIds?: Record<string, string>;
   /** Larger tiles for dual-channel / narrow layouts. */
   dense?: boolean;
-  /** Pass `null` to clear the current selection. */
-  onSelect: (
+  /** Single-select callback (legacy). */
+  onSelect?: (
     postId: string | null,
     postUrl?: string,
     thumbUrl?: string,
     caption?: string
   ) => void;
+  /** Multi-select callback — receives the full current selection. */
+  onSelectMany?: (posts: PostPick[]) => void;
 }
 
 export default function PostPicker({
-  selectedPostId,
+  selectedPostId = null,
+  selectedPostIds,
+  maxSelected = MAX_SPECIFIC_POSTS,
   channel = "instagram",
   instagramAccountId,
   facebookPageId,
   usedPostIds,
   dense = false,
   onSelect,
+  onSelectMany,
 }: PostPickerProps) {
   const { t } = useI18n();
+  const multi = Array.isArray(selectedPostIds) || Boolean(onSelectMany);
+  const currentIds = multi
+    ? selectedPostIds ?? (selectedPostId ? [selectedPostId] : [])
+    : selectedPostId
+      ? [selectedPostId]
+      : [];
+
   const [limitations, setLimitations] = useState<string[]>([]);
   const [posts, setPosts] = useState<InstagramPost[]>([]);
   const [loading, setLoading] = useState(true);
@@ -60,8 +85,8 @@ export default function PostPicker({
   const [query, setQuery] = useState("");
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [shown, setShown] = useState(PAGE_SIZE);
-  // Tracks thumbs that failed CDN load so we show the caption fallback.
   const [brokenThumbs, setBrokenThumbs] = useState<Record<string, true>>({});
+  const [pickedMeta, setPickedMeta] = useState<Record<string, PostPick>>({});
 
   useEffect(() => {
     let cancelled = false;
@@ -91,7 +116,6 @@ export default function PostPicker({
       params.set("all", "true");
     }
 
-    // v2: carousel children thumbs + layout fix — bust stale caches.
     const cacheKey = isFacebook
       ? `fb-posts:v2:${facebookPageId ?? "default"}`
       : `ig-posts:v2:${instagramAccountId ?? "default"}`;
@@ -150,6 +174,59 @@ export default function PostPicker({
       cancelled = true;
     };
   }, [channel, facebookPageId, instagramAccountId]);
+
+  function emitSelection(nextIds: string[], meta: Record<string, PostPick>) {
+    const picks = nextIds.map(
+      (id) => meta[id] ?? { postId: id }
+    );
+    if (onSelectMany) {
+      onSelectMany(picks);
+      return;
+    }
+    if (onSelect) {
+      const first = picks[0];
+      if (!first) onSelect(null);
+      else onSelect(first.postId, first.postUrl, first.thumbUrl, first.caption);
+    }
+  }
+
+  function togglePost(post: InstagramPost) {
+    const thumb = post.thumbnail_url || post.media_url;
+    const pick: PostPick = {
+      postId: post.id,
+      postUrl: post.permalink,
+      thumbUrl: thumb,
+      caption: post.caption,
+    };
+    const isSelected = currentIds.includes(post.id);
+
+    if (!multi) {
+      if (isSelected) {
+        emitSelection([], {});
+        return;
+      }
+      const meta = { [post.id]: pick };
+      setPickedMeta(meta);
+      emitSelection([post.id], meta);
+      return;
+    }
+
+    if (isSelected) {
+      const nextIds = currentIds.filter((id) => id !== post.id);
+      const nextMeta = { ...pickedMeta };
+      delete nextMeta[post.id];
+      setPickedMeta(nextMeta);
+      emitSelection(nextIds, nextMeta);
+      return;
+    }
+
+    if (currentIds.length >= maxSelected) return;
+
+    const nextIds = [...currentIds, post.id];
+    const nextMeta = { ...pickedMeta, [post.id]: pick };
+    setPickedMeta(nextMeta);
+    emitSelection(nextIds, nextMeta);
+  }
 
   if (loading) {
     return (
@@ -226,17 +303,31 @@ export default function PostPicker({
               {t("Already used")}
             </p>
           )}
-          {selectedPostId ? (
+          {currentIds.length > 0 ? (
             <div className="flex items-center justify-between gap-2 px-1">
-              <span className="text-xs text-muted">{t("Selected")}</span>
+              <span className="text-xs text-muted">
+                {multi
+                  ? t("{count} selected (max {max})", {
+                      count: currentIds.length,
+                      max: maxSelected,
+                    })
+                  : t("Selected")}
+              </span>
               <button
                 type="button"
-                onClick={() => onSelect(null)}
+                onClick={() => {
+                  setPickedMeta({});
+                  emitSelection([], {});
+                }}
                 className="text-xs font-medium text-accent hover:underline"
               >
                 {t("Clear selection")}
               </button>
             </div>
+          ) : multi ? (
+            <p className="px-1 text-xs text-muted">
+              {t("Select up to {max} posts", { max: maxSelected })}
+            </p>
           ) : null}
           <div
             className={`grid gap-2 overflow-x-hidden overflow-y-auto p-1 ${
@@ -247,9 +338,10 @@ export default function PostPicker({
             style={{ gridAutoRows: "min-content" }}
           >
             {visible.map((post) => {
-              const isSelected = selectedPostId === post.id;
+              const isSelected = currentIds.includes(post.id);
               const usedByName = usedPostIds?.[post.id];
               const isUsed = Boolean(usedByName) && !isSelected;
+              const atLimit = multi && !isSelected && currentIds.length >= maxSelected;
               const thumb = post.thumbnail_url || post.media_url;
               const thumbBroken = Boolean(brokenThumbs[post.id]);
               const showThumb = Boolean(thumb) && !thumbBroken;
@@ -266,22 +358,19 @@ export default function PostPicker({
                 <button
                   key={post.id}
                   type="button"
-                  onClick={() => {
-                    if (isSelected) {
-                      onSelect(null);
-                      return;
-                    }
-                    onSelect(post.id, post.permalink, thumb, post.caption);
-                  }}
+                  disabled={atLimit}
+                  onClick={() => togglePost(post)}
                   onMouseEnter={() => setHoveredId(post.id)}
                   onMouseLeave={() =>
                     setHoveredId((cur) => (cur === post.id ? null : cur))
                   }
                   aria-pressed={isSelected}
                   title={
-                    isUsed && usedByName
-                      ? t('Already used by "{name}"', { name: usedByName })
-                      : captionPreview
+                    atLimit
+                      ? t("Maximum {max} posts", { max: maxSelected })
+                      : isUsed && usedByName
+                        ? t('Already used by "{name}"', { name: usedByName })
+                        : captionPreview
                   }
                   className={`
               relative aspect-square w-full min-w-0 overflow-hidden rounded-lg border-2 bg-surface
@@ -290,7 +379,9 @@ export default function PostPicker({
                   ? "border-accent"
                   : isUsed
                     ? "border-warning/40 hover:border-warning/60"
-                    : "border-border hover:border-border-hover"
+                    : atLimit
+                      ? "border-border opacity-40"
+                      : "border-border hover:border-border-hover"
               }
             `}
                 >
@@ -335,7 +426,9 @@ export default function PostPicker({
                   )}
                   {isSelected && (
                     <span className="absolute bottom-0 inset-x-0 bg-accent text-white text-xs py-1">
-                      {t("Selected")}
+                      {multi
+                        ? `${currentIds.indexOf(post.id) + 1}/${currentIds.length}`
+                        : t("Selected")}
                     </span>
                   )}
                 </button>

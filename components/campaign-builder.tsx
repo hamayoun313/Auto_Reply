@@ -16,7 +16,7 @@ import { useI18n } from "@/lib/i18n/provider";
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { type AccountOption } from "@/components/account-select";
-import PostPicker from "@/components/post-picker";
+import PostPicker, { type PostPick } from "@/components/post-picker";
 import CampaignPreview, { type PreviewTab } from "@/components/campaign-preview";
 import { readCache, writeCache } from "@/lib/client-cache";
 import {
@@ -24,6 +24,15 @@ import {
   IMPORT_ACCOUNT_KEY,
   type ImportRow,
 } from "@/lib/import-queue";
+import {
+  buildBrandGroups,
+  findBrandKeyForPair,
+  normalizeBrandKey,
+} from "@/lib/brand-pages";
+import {
+  MAX_SPECIFIC_POSTS,
+  splitPrimaryAndExtraPostIds,
+} from "@/lib/automation/post-targets";
 
 type TriggerScope = "specific" | "any" | "next";
 type MatchMode = "specific" | "any";
@@ -45,6 +54,7 @@ interface LoadedCampaign {
   id: string;
   name: string;
   postId: string | null;
+  postIds?: string[];
   postUrl: string | null;
   pendingNextReel: boolean;
   matchAnyPost: boolean;
@@ -97,27 +107,41 @@ function Radio({
   checked,
   onSelect,
   children,
+  disabled = false,
+  hint,
 }: {
   checked: boolean;
   onSelect: () => void;
   children: React.ReactNode;
+  disabled?: boolean;
+  hint?: string;
 }) {
   return (
     <button
       type="button"
-      onClick={onSelect}
+      onClick={() => {
+        if (!disabled) onSelect();
+      }}
+      disabled={disabled}
       className={`flex w-full items-center gap-3 rounded-lg border px-3 py-2.5 text-left text-sm transition-colors ${
-        checked ? "border-accent bg-accent/5" : "border-border hover:border-border-hover"
+        disabled
+          ? "cursor-not-allowed border-border opacity-50"
+          : checked
+            ? "border-accent bg-accent/5"
+            : "border-border hover:border-border-hover"
       }`}
     >
       <span
         className={`grid h-4 w-4 shrink-0 place-items-center rounded-full border ${
-          checked ? "border-accent" : "border-zinc-500"
+          checked && !disabled ? "border-accent" : "border-zinc-500"
         }`}
       >
-        {checked && <span className="h-2 w-2 rounded-full bg-accent" />}
+        {checked && !disabled && <span className="h-2 w-2 rounded-full bg-accent" />}
       </span>
-      <span className="flex-1 text-foreground">{children}</span>
+      <span className="flex-1">
+        <span className="block text-foreground">{children}</span>
+        {hint ? <span className="mt-0.5 block text-xs text-muted">{hint}</span> : null}
+      </span>
     </button>
   );
 }
@@ -168,14 +192,28 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
 
   const [triggerScope, setTriggerScope] = useState<TriggerScope>("specific");
   const [postId, setPostId] = useState<string | null>(null);
+  const [postIds, setPostIds] = useState<string[]>([]);
   const [postUrl, setPostUrl] = useState<string | null>(null);
+  const [postUrlById, setPostUrlById] = useState<Record<string, string>>({});
   const [postThumb, setPostThumb] = useState<string | null>(null);
   const [postCaption, setPostCaption] = useState("");
   // Dual-channel (All): separate post picks; shared keywords/DM below.
-  const [facebookPostId, setFacebookPostId] = useState<string | null>(null);
-  const [facebookPostUrl, setFacebookPostUrl] = useState<string | null>(null);
-  const [instagramPostId, setInstagramPostId] = useState<string | null>(null);
-  const [instagramPostUrl, setInstagramPostUrl] = useState<string | null>(null);
+  const [facebookPostIds, setFacebookPostIds] = useState<string[]>([]);
+  const [facebookPostUrlById, setFacebookPostUrlById] = useState<
+    Record<string, string>
+  >({});
+  const [instagramPostIds, setInstagramPostIds] = useState<string[]>([]);
+  const [instagramPostUrlById, setInstagramPostUrlById] = useState<
+    Record<string, string>
+  >({});
+  const facebookPostId = facebookPostIds[0] ?? null;
+  const facebookPostUrl = facebookPostId
+    ? facebookPostUrlById[facebookPostId] ?? null
+    : null;
+  const instagramPostId = instagramPostIds[0] ?? null;
+  const instagramPostUrl = instagramPostId
+    ? instagramPostUrlById[instagramPostId] ?? null
+    : null;
 
   const bothChannels = channelFilter === "all";
 
@@ -328,8 +366,18 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
         setTriggerScope(
           c.matchAnyPost ? "any" : c.pendingNextReel ? "next" : "specific"
         );
-        setPostId(c.postId);
-        setPostUrl(c.postUrl);
+        {
+          const ids = [
+            ...(c.postId ? [c.postId] : []),
+            ...(c.postIds ?? []),
+          ].filter((id, i, arr) => id && arr.indexOf(id) === i);
+          setPostIds(ids);
+          setPostId(ids[0] ?? null);
+          setPostUrl(c.postUrl);
+          if (c.postUrl && ids[0]) {
+            setPostUrlById({ [ids[0]]: c.postUrl });
+          }
+        }
         setMatchMode(c.matchAnyWord ? "any" : "specific");
         setKeywordText(c.keywords.join(", "));
         setWholeWordMatch(c.wholeWordMatch ?? true);
@@ -382,14 +430,18 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
         if (cancelled || !payload.success) return;
         const map: Record<string, string> = {};
         for (const a of payload.data as LoadedCampaign[]) {
-          if (!a.postId) continue;
+          const ids = [
+            ...(a.postId ? [a.postId] : []),
+            ...(a.postIds ?? []),
+          ];
+          if (ids.length === 0) continue;
           if (channel === "facebook") {
             if (a.facebookPageId !== scopeId) continue;
           } else if (a.instagramAccountId !== scopeId) {
             continue;
           }
           if (mode === "edit" && a.id === campaignId) continue;
-          map[a.postId] = a.name;
+          for (const id of ids) map[id] = a.name;
         }
         setUsedPosts(map);
       })
@@ -411,9 +463,15 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
     setName(row.name ?? "");
     setTriggerScope("specific");
     setPostId(null);
+    setPostIds([]);
     setPostUrl(null);
+    setPostUrlById({});
     setPostThumb(null);
     setPostCaption("");
+    setFacebookPostIds([]);
+    setFacebookPostUrlById({});
+    setInstagramPostIds([]);
+    setInstagramPostUrlById({});
     setMatchMode("specific");
     setKeywordText((row.keywords ?? []).join(", "));
     setDmMessage(row.dmMessage ?? "");
@@ -518,101 +576,140 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
         "Facebook Page"
       : accounts.find((a) => a.id === selectedAccountId)?.username ?? "yourbrand";
 
-  function handlePostSelect(
-    id: string | null,
-    url?: string,
-    thumb?: string,
-    caption?: string
-  ) {
-    if (!id) {
-      setPostId(null);
-      setPostUrl(null);
-      setPostThumb(null);
-      setPostCaption("");
-      return;
+  function applyPostPicks(picks: PostPick[]) {
+    const ids = picks.map((p) => p.postId);
+    const urls: Record<string, string> = {};
+    for (const pick of picks) {
+      if (pick.postUrl) urls[pick.postId] = pick.postUrl;
     }
-    setPostId(id);
-    setPostUrl(url ?? null);
-    setPostThumb(thumb ?? null);
-    setPostCaption(caption ?? "");
+    setPostIds(ids);
+    setPostId(ids[0] ?? null);
+    setPostUrl(picks[0]?.postUrl ?? null);
+    setPostUrlById(urls);
+    setPostThumb(picks[0]?.thumbUrl ?? null);
+    setPostCaption(picks[0]?.caption ?? "");
   }
 
-  function handleFacebookPostSelect(
-    id: string | null,
-    url?: string,
-    thumb?: string,
-    caption?: string
-  ) {
-    if (!id) {
-      setFacebookPostId(null);
-      setFacebookPostUrl(null);
-      if (!bothChannels) handlePostSelect(null);
-      else {
-        setPostThumb(null);
-        setPostCaption("");
-      }
-      return;
+  function handlePostSelectMany(picks: PostPick[]) {
+    applyPostPicks(picks);
+  }
+
+  function handleFacebookPostSelectMany(picks: PostPick[]) {
+    const ids = picks.map((p) => p.postId);
+    const urls: Record<string, string> = {};
+    for (const pick of picks) {
+      if (pick.postUrl) urls[pick.postId] = pick.postUrl;
     }
-    setFacebookPostId(id);
-    setFacebookPostUrl(url ?? null);
+    setFacebookPostIds(ids);
+    setFacebookPostUrlById(urls);
     if (bothChannels) {
-      setPostThumb(thumb ?? null);
-      setPostCaption(caption ?? "");
+      setPostThumb(picks[0]?.thumbUrl ?? null);
+      setPostCaption(picks[0]?.caption ?? "");
     } else {
-      handlePostSelect(id, url, thumb, caption);
+      applyPostPicks(picks);
     }
   }
 
-  function handleInstagramPostSelect(
-    id: string | null,
-    url?: string,
-    thumb?: string,
-    caption?: string
-  ) {
-    if (!id) {
-      setInstagramPostId(null);
-      setInstagramPostUrl(null);
-      if (!bothChannels) handlePostSelect(null);
-      else {
-        setPostThumb(null);
-        setPostCaption("");
-      }
-      return;
+  function handleInstagramPostSelectMany(picks: PostPick[]) {
+    const ids = picks.map((p) => p.postId);
+    const urls: Record<string, string> = {};
+    for (const pick of picks) {
+      if (pick.postUrl) urls[pick.postId] = pick.postUrl;
     }
-    setInstagramPostId(id);
-    setInstagramPostUrl(url ?? null);
+    setInstagramPostIds(ids);
+    setInstagramPostUrlById(urls);
     if (bothChannels) {
-      setPostThumb(thumb ?? null);
-      setPostCaption(caption ?? "");
+      setPostThumb(picks[0]?.thumbUrl ?? null);
+      setPostCaption(picks[0]?.caption ?? "");
     } else {
-      handlePostSelect(id, url, thumb, caption);
+      applyPostPicks(picks);
     }
   }
 
   function clearPostPicks() {
     setPostId(null);
+    setPostIds([]);
     setPostUrl(null);
+    setPostUrlById({});
     setPostThumb(null);
     setPostCaption("");
-    setFacebookPostId(null);
-    setFacebookPostUrl(null);
-    setInstagramPostId(null);
-    setInstagramPostUrl(null);
+    setFacebookPostIds([]);
+    setFacebookPostUrlById({});
+    setInstagramPostIds([]);
+    setInstagramPostUrlById({});
   }
 
   function pairInstagramForFacebook(facebookPageDbId: string) {
     const page = facebookPages.find((p) => p.id === facebookPageDbId);
     if (!page || accounts.length === 0) return;
-    const hay = page.name.toLowerCase().replace(/[^a-z0-9]+/g, "");
+    const hay = normalizeBrandKey(page.name);
     const match =
       accounts.find((a) => {
-        const u = a.username.toLowerCase().replace(/[^a-z0-9]+/g, "");
-        return hay.includes(u) || u.includes(hay.slice(0, 8));
+        const u = normalizeBrandKey(a.username);
+        const n = normalizeBrandKey(a.name ?? "");
+        return (
+          (u && (hay.includes(u) || u.includes(hay))) ||
+          (n && (hay.includes(n) || n.includes(hay)))
+        );
       }) ??
-      accounts.find((a) =>
-        page.name.toLowerCase().includes(a.username.toLowerCase().split(/[._]/)[0] ?? "")
-      );
+      accounts.find((a) => {
+        const stem = normalizeBrandKey(a.username.split(/[._]/)[0] ?? "");
+        return stem.length >= 3 && hay.includes(stem);
+      });
     if (match) setSelectedAccountId(match.id);
+  }
+
+  function pairFacebookForInstagram(instagramAccountId: string) {
+    const account = accounts.find((a) => a.id === instagramAccountId);
+    if (!account || facebookPages.length === 0) return;
+    const hay = normalizeBrandKey(account.username);
+    const nameKey = normalizeBrandKey(account.name ?? "");
+    const match =
+      facebookPages.find((p) => {
+        const page = normalizeBrandKey(p.name);
+        return (
+          (hay && (page.includes(hay) || hay.includes(page))) ||
+          (nameKey && (page.includes(nameKey) || nameKey.includes(page)))
+        );
+      }) ?? null;
+    if (match) setSelectedFacebookPageId(match.id);
+  }
+
+  const brandGroups = useMemo(
+    () => buildBrandGroups(accounts, facebookPages),
+    [accounts, facebookPages]
+  );
+
+  const selectedBrandKey =
+    findBrandKeyForPair(
+      brandGroups,
+      selectedFacebookPageId || null,
+      selectedAccountId || null
+    ) ?? "";
+
+  function selectBrand(key: string) {
+    const brand = brandGroups.find((b) => b.key === key);
+    if (!brand) return;
+    clearPostPicks();
+    if (brand.facebookPageId) setSelectedFacebookPageId(brand.facebookPageId);
+    if (brand.instagramAccountId) setSelectedAccountId(brand.instagramAccountId);
+    if (brand.facebookPageId && brand.instagramAccountId) {
+      setChannelFilter("all");
+      setOpeningDmEnabled(false);
+      setRequireFollow(false);
+      setDmTriggerEnabled(false);
+      if (triggerScope === "next") setTriggerScope("specific");
+    } else if (brand.facebookPageId) {
+      setChannelFilter("facebook");
+      setChannel("facebook");
+      setOpeningDmEnabled(false);
+      setRequireFollow(false);
+      setDmTriggerEnabled(false);
+      if (triggerScope === "next") setTriggerScope("specific");
+    } else if (brand.instagramAccountId) {
+      setChannelFilter("instagram");
+      setChannel("instagram");
+    }
   }
 
   function ensureLinkToken() {
@@ -623,20 +720,29 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
     activeValue: boolean;
     channel: CampaignChannel;
     campaignName: string;
-    postIdValue: string | null;
-    postUrlValue: string | null;
+    postIdValues: string[];
+    postUrlByIdValue: Record<string, string>;
   }) {
     const isFacebook = opts.channel === "facebook";
     // Dual Both campaigns always send the main DM directly on both channels.
     // Opening DM / follow gate are Instagram-only extras and stay off for twins.
     const allowIgExtras = !isFacebook && !bothChannels;
+    const split =
+      triggerScope === "specific"
+        ? splitPrimaryAndExtraPostIds(opts.postIdValues)
+        : { postId: null, postIds: [] as string[] };
+    const primaryUrl =
+      split.postId && opts.postUrlByIdValue[split.postId]
+        ? opts.postUrlByIdValue[split.postId]
+        : null;
     return {
       name: opts.campaignName,
       channel: opts.channel,
       instagramAccountId: isFacebook ? null : selectedAccountId,
       facebookPageId: isFacebook ? selectedFacebookPageId : null,
-      postId: triggerScope === "specific" ? opts.postIdValue : null,
-      postUrl: triggerScope === "specific" ? opts.postUrlValue : null,
+      postId: split.postId,
+      postIds: split.postIds,
+      postUrl: primaryUrl,
       matchAnyPost: triggerScope === "any",
       pendingNextReel: isFacebook ? false : triggerScope === "next",
       matchAnyWord: matchMode === "any",
@@ -719,9 +825,9 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
         return setError(t("Select a Facebook Page."));
       if (!selectedAccountId)
         return setError(t("Select an Instagram account."));
-      if (triggerScope === "specific" && !facebookPostId)
+      if (triggerScope === "specific" && facebookPostIds.length === 0)
         return setError(t("Pick a Facebook post."));
-      if (triggerScope === "specific" && !instagramPostId)
+      if (triggerScope === "specific" && instagramPostIds.length === 0)
         return setError(t("Pick an Instagram post or reel."));
       if (triggerScope === "next")
         return setError(t("Next-post targeting is Instagram-only. Use specific or any."));
@@ -730,7 +836,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
         return setError(t("Connect an Instagram account first."));
       if (channel === "facebook" && !selectedFacebookPageId)
         return setError("Connect a Facebook Page first.");
-      if (triggerScope === "specific" && !postId)
+      if (triggerScope === "specific" && postIds.length === 0)
         return setError(
           channel === "facebook"
             ? "Pick a Facebook post to trigger the campaign."
@@ -778,25 +884,24 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
           activeValue,
           channel: "facebook",
           campaignName: `${baseName} (Facebook)`,
-          postIdValue: facebookPostId,
-          postUrlValue: facebookPostUrl,
+          postIdValues: facebookPostIds,
+          postUrlByIdValue: facebookPostUrlById,
         });
         const igPayload = buildPayload({
           activeValue,
           channel: "instagram",
           campaignName: `${baseName} (Instagram)`,
-          postIdValue: instagramPostId,
-          postUrlValue: instagramPostUrl,
+          postIdValues: instagramPostIds,
+          postUrlByIdValue: instagramPostUrlById,
         });
         await postAutomation(fbPayload);
         await postAutomation(igPayload);
-        if (facebookPostId)
-          setUsedPosts((prev) => ({ ...prev, [facebookPostId]: fbPayload.name }));
-        if (instagramPostId)
-          setUsedPosts((prev) => ({
-            ...prev,
-            [instagramPostId]: igPayload.name,
-          }));
+        setUsedPosts((prev) => {
+          const next = { ...prev };
+          for (const id of facebookPostIds) next[id] = fbPayload.name;
+          for (const id of instagramPostIds) next[id] = igPayload.name;
+          return next;
+        });
         router.push("/campaigns");
         router.refresh();
         return;
@@ -806,12 +911,16 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
         activeValue,
         channel,
         campaignName: baseName,
-        postIdValue: postId,
-        postUrlValue: postUrl,
+        postIdValues: postIds,
+        postUrlByIdValue: postUrlById,
       });
       await postAutomation(payload);
-      if (triggerScope === "specific" && postId) {
-        setUsedPosts((prev) => ({ ...prev, [postId]: payload.name }));
+      if (triggerScope === "specific" && postIds.length > 0) {
+        setUsedPosts((prev) => {
+          const next = { ...prev };
+          for (const id of postIds) next[id] = payload.name;
+          return next;
+        });
       }
       if (importQueue && importQueue.length > 1) {
         const remaining = importQueue.slice(1);
@@ -1014,7 +1123,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                     clearPostPicks();
                     if (value === "instagram") {
                       setChannel("instagram");
-                      if (triggerScope === "next") setTriggerScope("specific");
+                      // Keep "next" when switching to Instagram — it is IG-only.
                     } else if (value === "facebook") {
                       setChannel("facebook");
                       setOpeningDmEnabled(false);
@@ -1028,6 +1137,8 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                       if (triggerScope === "next") setTriggerScope("specific");
                       if (selectedFacebookPageId) {
                         pairInstagramForFacebook(selectedFacebookPageId);
+                      } else if (selectedAccountId) {
+                        pairFacebookForInstagram(selectedAccountId);
                       }
                     }
                   }}
@@ -1051,51 +1162,74 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
           </div>
 
           {bothChannels ? (
-            <div className="grid gap-3 pt-2 sm:grid-cols-2">
-              <label className="flex flex-col gap-2 text-sm">
-                <span className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
-                  {t("Facebook Page")}
-                </span>
-                <select
-                  value={selectedFacebookPageId}
-                  onChange={(e) => {
-                    const id = e.target.value;
-                    setSelectedFacebookPageId(id);
-                    setFacebookPostId(null);
-                    setFacebookPostUrl(null);
-                    pairInstagramForFacebook(id);
-                  }}
-                  className="rounded-xl border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none focus:border-accent/40"
-                >
-                  <option value="">{t("Select Facebook Page")}</option>
-                  {facebookPages.map((page) => (
-                    <option key={page.id} value={page.id}>
-                      {page.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="flex flex-col gap-2 text-sm">
-                <span className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
-                  {t("Instagram account")}
-                </span>
-                <select
-                  value={selectedAccountId}
-                  onChange={(e) => {
-                    setSelectedAccountId(e.target.value);
-                    setInstagramPostId(null);
-                    setInstagramPostUrl(null);
-                  }}
-                  className="rounded-xl border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none focus:border-accent/40"
-                >
-                  <option value="">{t("Select Instagram account")}</option>
-                  {accounts.map((account) => (
-                    <option key={account.id} value={account.id}>
-                      @{account.username}
-                    </option>
-                  ))}
-                </select>
-              </label>
+            <div className="space-y-3 pt-2">
+              {brandGroups.some((b) => b.facebookPageId && b.instagramAccountId) ? (
+                <label className="flex flex-col gap-2 text-sm">
+                  <span className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                    {t("Page / brand")}
+                  </span>
+                  <select
+                    value={selectedBrandKey}
+                    onChange={(e) => selectBrand(e.target.value)}
+                    className="rounded-xl border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none focus:border-accent/40"
+                  >
+                    <option value="">{t("Select a brand (FB + IG)")}</option>
+                    {brandGroups.map((brand) => (
+                      <option key={brand.key} value={brand.key}>
+                        {brand.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label className="flex flex-col gap-2 text-sm">
+                  <span className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                    {t("Facebook Page")}
+                  </span>
+                  <select
+                    value={selectedFacebookPageId}
+                    onChange={(e) => {
+                      const id = e.target.value;
+                      setSelectedFacebookPageId(id);
+                      setFacebookPostIds([]);
+                      setFacebookPostUrlById({});
+                      pairInstagramForFacebook(id);
+                    }}
+                    className="rounded-xl border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none focus:border-accent/40"
+                  >
+                    <option value="">{t("Select Facebook Page")}</option>
+                    {facebookPages.map((page) => (
+                      <option key={page.id} value={page.id}>
+                        {page.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="flex flex-col gap-2 text-sm">
+                  <span className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                    {t("Instagram account")}
+                  </span>
+                  <select
+                    value={selectedAccountId}
+                    onChange={(e) => {
+                      const id = e.target.value;
+                      setSelectedAccountId(id);
+                      setInstagramPostIds([]);
+                      setInstagramPostUrlById({});
+                      pairFacebookForInstagram(id);
+                    }}
+                    className="rounded-xl border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none focus:border-accent/40"
+                  >
+                    <option value="">{t("Select Instagram account")}</option>
+                    {accounts.map((account) => (
+                      <option key={account.id} value={account.id}>
+                        @{account.username}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
             </div>
           ) : (
             <div className="pt-2">
@@ -1149,12 +1283,13 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                   {t("Facebook post picker")}
                 </div>
                 <PostPicker
-                  selectedPostId={facebookPostId}
+                  selectedPostIds={facebookPostIds}
+                  maxSelected={MAX_SPECIFIC_POSTS}
                   channel="facebook"
                   facebookPageId={selectedFacebookPageId || null}
                   usedPostIds={usedPosts}
                   dense
-                  onSelect={handleFacebookPostSelect}
+                  onSelectMany={handleFacebookPostSelectMany}
                 />
               </div>
               <div className="rounded-lg border border-border p-3">
@@ -1162,12 +1297,13 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                   {t("Instagram post picker")}
                 </div>
                 <PostPicker
-                  selectedPostId={instagramPostId}
+                  selectedPostIds={instagramPostIds}
+                  maxSelected={MAX_SPECIFIC_POSTS}
                   channel="instagram"
                   instagramAccountId={selectedAccountId || null}
                   usedPostIds={usedPosts}
                   dense
-                  onSelect={handleInstagramPostSelect}
+                  onSelectMany={handleInstagramPostSelectMany}
                 />
               </div>
             </div>
@@ -1180,12 +1316,13 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                   : t("Instagram post picker")}
               </div>
               <PostPicker
-                selectedPostId={postId}
+                selectedPostIds={postIds}
+                maxSelected={MAX_SPECIFIC_POSTS}
                 channel={channel}
                 instagramAccountId={selectedAccountId}
                 facebookPageId={selectedFacebookPageId}
                 usedPostIds={usedPosts}
-                onSelect={handlePostSelect}
+                onSelectMany={handlePostSelectMany}
               />
             </div>
           ) : null}
@@ -1199,6 +1336,20 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
                 ? t("any Facebook post")
                 : t("any Instagram post or reel")}
           </Radio>
+          {triggerScope === "any" && bothChannels ? (
+            <p className="text-xs text-muted px-1">
+              {t(
+                "Runs on every new Facebook Page post and every new Instagram post/reel for the selected brand."
+              )}
+            </p>
+          ) : null}
+          {triggerScope === "any" && !bothChannels && channel === "facebook" ? (
+            <p className="text-xs text-muted px-1">
+              {t(
+                "Watches recent posts on this Facebook Page (no need to pick one)."
+              )}
+            </p>
+          ) : null}
           {!bothChannels && channel === "instagram" ? (
             <Radio
               checked={triggerScope === "next"}
@@ -1206,7 +1357,20 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
             >
               {t("next post or reel")}
             </Radio>
-          ) : null}
+          ) : (
+            <button
+              type="button"
+              disabled
+              className="flex w-full cursor-not-allowed items-center gap-3 rounded-lg border border-border px-3 py-2.5 text-left text-sm opacity-50"
+              title={t("Next-post targeting is Instagram-only. Use specific or any.")}
+            >
+              <span className="grid h-4 w-4 shrink-0 place-items-center rounded-full border border-zinc-500" />
+              <span className="flex-1 text-muted">
+                {t("next post or reel")}{" "}
+                <span className="text-xs">({t("Instagram only")})</span>
+              </span>
+            </button>
+          )}
         </Section>
 
         <Section title={t("And this comment has")}>

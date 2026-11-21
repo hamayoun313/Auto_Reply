@@ -27,13 +27,46 @@ export async function GET(request: NextRequest) {
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
   const requestedInstagramAccountId =
     request.nextUrl.searchParams.get("instagramAccountId");
+  const requestedFacebookPageId =
+    request.nextUrl.searchParams.get("facebookPageId");
   const selectedAccountId =
     requestedInstagramAccountId && requestedInstagramAccountId !== "all"
       ? requestedInstagramAccountId
       : null;
-  const accountFilter = selectedAccountId
-    ? { instagramAccountId: selectedAccountId }
-    : {};
+  const selectedFacebookPageId =
+    requestedFacebookPageId && requestedFacebookPageId !== "all"
+      ? requestedFacebookPageId
+      : null;
+  // Brand select: when both IDs are present, include FB + IG campaigns/logs.
+  const accountFilter =
+    selectedAccountId && selectedFacebookPageId
+      ? {
+          OR: [
+            { instagramAccountId: selectedAccountId },
+            { facebookPageId: selectedFacebookPageId },
+          ],
+        }
+      : selectedAccountId
+        ? { instagramAccountId: selectedAccountId }
+        : selectedFacebookPageId
+          ? { facebookPageId: selectedFacebookPageId }
+          : {};
+  // LinkClick has no facebookPageId — filter via the parent automation instead.
+  const clickFilter =
+    selectedAccountId && selectedFacebookPageId
+      ? {
+          OR: [
+            { instagramAccountId: selectedAccountId },
+            {
+              automation: { facebookPageId: selectedFacebookPageId },
+            },
+          ],
+        }
+      : selectedAccountId
+        ? { instagramAccountId: selectedAccountId }
+        : selectedFacebookPageId
+          ? { automation: { facebookPageId: selectedFacebookPageId } }
+          : {};
 
   const [
     workspace,
@@ -134,11 +167,11 @@ export async function GET(request: NextRequest) {
       _count: { _all: true },
     }),
     prisma.linkClick.findMany({
-      where: { workspaceId, createdAt: { gte: monthStart }, ...accountFilter },
+      where: { workspaceId, createdAt: { gte: monthStart }, ...clickFilter },
       select: CLICK_ROW_SELECT,
     }),
     prisma.linkClick.findMany({
-      where: { workspaceId, ...accountFilter },
+      where: { workspaceId, ...clickFilter },
       select: CLICK_ROW_SELECT,
     }),
     prisma.dmLog.groupBy({

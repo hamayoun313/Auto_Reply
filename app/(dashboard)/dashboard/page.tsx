@@ -8,7 +8,11 @@
 
 import { useI18n } from "@/lib/i18n/provider";
 import { useEffect, useState } from "react";
-import AccountSelect, { type AccountOption } from "@/components/account-select";
+import AccountSelect, {
+  type AccountOption,
+  type FacebookPageOption,
+} from "@/components/account-select";
+import { parseBrandSelectValue } from "@/lib/brand-pages";
 import StatCard from "@/components/stat-card";
 import StatusBadge from "@/components/status-badge";
 
@@ -27,6 +31,7 @@ interface DashboardStats {
   totalClicks: number;
   ctrThisMonth: number;
   instagramAccounts: AccountOption[];
+  facebookPages?: FacebookPageOption[];
   selectedInstagramAccountId: string | null;
   topKeywords: { keyword: string; count: number }[];
   dailyDMs: { date: string; count: number }[];
@@ -45,12 +50,16 @@ export default function DashboardPage() {
   const { t, label } = useI18n();
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [loading, setLoading] = useState(true);
-  const [selectedAccountId, setSelectedAccountId] = useState("all");
+  const [selectedBrandKey, setSelectedBrandKey] = useState("all");
 
   useEffect(() => {
     const params = new URLSearchParams();
-    if (selectedAccountId !== "all") {
-      params.set("instagramAccountId", selectedAccountId);
+    const brand = parseBrandSelectValue(selectedBrandKey);
+    if (brand.instagramAccountId) {
+      params.set("instagramAccountId", brand.instagramAccountId);
+    }
+    if (brand.facebookPageId) {
+      params.set("facebookPageId", brand.facebookPageId);
     }
 
     fetch(`/api/dashboard/stats${params.size ? `?${params}` : ""}`)
@@ -60,11 +69,11 @@ export default function DashboardPage() {
       })
       .catch(console.error)
       .finally(() => setLoading(false));
-  }, [selectedAccountId]);
+  }, [selectedBrandKey]);
 
-  function handleAccountChange(accountId: string) {
+  function handleBrandChange(brandKey: string) {
     setLoading(true);
-    setSelectedAccountId(accountId);
+    setSelectedBrandKey(brandKey);
   }
 
   if (loading) {
@@ -85,7 +94,9 @@ export default function DashboardPage() {
 
   const maxDM = Math.max(...(stats?.dailyDMs.map((d) => d.count) ?? [1]), 1);
 
-  const connectedCount = stats?.instagramAccounts.length ?? 0;
+  const igCount = stats?.instagramAccounts.length ?? 0;
+  const fbCount = stats?.facebookPages?.length ?? 0;
+  const connectedCount = igCount + fbCount;
 
   return (
     <div className="space-y-8">
@@ -105,11 +116,12 @@ export default function DashboardPage() {
             </a>
           </p>
         </div>
-        {stats && stats.instagramAccounts.length > 1 && (
+        {stats && connectedCount > 1 && (
           <AccountSelect
             accounts={stats.instagramAccounts}
-            value={selectedAccountId}
-            onChange={handleAccountChange}
+            facebookPages={stats.facebookPages ?? []}
+            value={selectedBrandKey}
+            onChange={handleBrandChange}
           />
         )}
       </div>

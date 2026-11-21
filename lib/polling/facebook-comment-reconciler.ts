@@ -54,7 +54,11 @@ export async function reconcileFacebookComments(): Promise<void> {
     where: {
       isActive: true,
       facebookPageId: { not: null },
-      OR: [{ postId: { not: null } }, { matchAnyPost: true }],
+      OR: [
+        { postId: { not: null } },
+        { postIds: { isEmpty: false } },
+        { matchAnyPost: true },
+      ],
     },
     include: {
       facebookPage: true,
@@ -89,16 +93,22 @@ export async function reconcileFacebookComments(): Promise<void> {
       continue;
     }
 
-    // Specific post, or recent feed for matchAnyPost (webhook-less Railway).
+    // Specific post(s), or recent feed for matchAnyPost (webhook-less Railway).
     const targetPosts: Array<{ id: string; alternateIds: string[] }> = [];
-    if (automation.postId) {
-      const underscore = automation.postId.indexOf("_");
-      const short =
-        underscore > 0 ? automation.postId.slice(underscore + 1) : null;
-      targetPosts.push({
-        id: automation.postId,
-        alternateIds: short ? [short] : [],
-      });
+    const specificIds = [
+      ...(automation.postId ? [automation.postId] : []),
+      ...(automation.postIds ?? []),
+    ].filter((id, index, arr) => id && arr.indexOf(id) === index);
+    if (specificIds.length > 0) {
+      for (const postId of specificIds) {
+        const underscore = postId.indexOf("_");
+        const short =
+          underscore > 0 ? postId.slice(underscore + 1) : null;
+        targetPosts.push({
+          id: postId,
+          alternateIds: short ? [short] : [],
+        });
+      }
     } else if (automation.matchAnyPost) {
       try {
         const feed = await listFacebookPagePosts(
@@ -155,7 +165,7 @@ export async function reconcileFacebookComments(): Promise<void> {
             // For matchAnyPost, ignore comments older than the campaign itself.
             if (
               automation.matchAnyPost &&
-              !automation.postId &&
+              specificIds.length === 0 &&
               Number.isFinite(createdMs) &&
               createdMs < automation.createdAt.getTime()
             ) {

@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "Automation" ADD COLUMN IF NOT EXISTS "postIds" TEXT[] DEFAULT ARRAY[]::TEXT[];

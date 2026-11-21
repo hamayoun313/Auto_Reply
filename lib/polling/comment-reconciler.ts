@@ -119,6 +119,7 @@ export async function reconcileComments(): Promise<void> {
       id: true,
       name: true,
       postId: true,
+      postIds: true,
       matchAnyPost: true,
       matchAnyWord: true,
       keywords: true,
@@ -153,7 +154,9 @@ export async function reconcileComments(): Promise<void> {
     };
     // Specific-post campaigns must cover the whole reply window so no matching
     // comment is left behind. "Any post" stays short to avoid multi-post burns.
-    const sinceMs = automation.postId
+    const hasSpecificPosts =
+      Boolean(automation.postId) || (automation.postIds?.length ?? 0) > 0;
+    const sinceMs = hasSpecificPosts
       ? specificLookbackMs
       : Math.max(anyPostLookbackMs, automation.createdAt.getTime());
     const stat = await sweepCampaign({
@@ -284,6 +287,7 @@ async function sweepCampaign({
     id: string;
     name: string;
     postId: string | null;
+    postIds?: string[];
     matchAnyPost: boolean;
     matchAnyWord: boolean;
     keywords: string[];
@@ -330,12 +334,18 @@ async function sweepCampaign({
     return stat;
   }
 
-  // Which media this campaign covers: its own post, or the recent feed if it
+  // Which media this campaign covers: its own post(s), or the recent feed if it
   // matches any post.
   const mediaIds: string[] = [];
-  if (automation.postId) {
-    mediaIds.push(automation.postId);
-    mediaIds.push(...(await adMediaFor(automation.postId)));
+  const specificIds = [
+    ...(automation.postId ? [automation.postId] : []),
+    ...(automation.postIds ?? []),
+  ].filter((id, index, arr) => id && arr.indexOf(id) === index);
+  if (specificIds.length > 0) {
+    for (const id of specificIds) {
+      mediaIds.push(id);
+      mediaIds.push(...(await adMediaFor(id)));
+    }
   } else if (automation.matchAnyPost) {
     try {
       const media = await getUserMedia({

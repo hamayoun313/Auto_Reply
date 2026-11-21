@@ -334,6 +334,10 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       OR: [
         { postId: mediaId },
         ...(originalMediaId ? [{ postId: originalMediaId }] : []),
+        { postIds: { has: mediaId } },
+        ...(originalMediaId
+          ? [{ postIds: { has: originalMediaId } }]
+          : []),
         { matchAnyPost: true },
       ],
       isActive: true,

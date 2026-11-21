@@ -216,6 +216,8 @@ model Automation {
   name           String
   goal           String?
   postId         String?
+  /// Extra specific posts (2–3+) for the same campaign; `postId` stays the primary.
+  postIds        String[] @default([])
   postUrl        String?
   pendingNextReel Boolean @default(false)
   matchAnyPost   Boolean @default(false)

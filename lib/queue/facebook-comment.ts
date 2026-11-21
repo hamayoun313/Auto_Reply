@@ -96,6 +96,7 @@ export async function processFacebookComment(
         : {}),
       OR: [
         ...postIds.map((id) => ({ postId: id })),
+        ...postIds.map((id) => ({ postIds: { has: id } })),
         { matchAnyPost: true },
       ],
       isActive: true,

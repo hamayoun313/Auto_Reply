@@ -102,11 +102,35 @@ export type FacebookPagePost = {
   created_time?: string;
   permalink_url?: string | null;
   full_picture?: string | null;
+  picture?: string | null;
+  status_type?: string | null;
+  attachments?: {
+    data?: Array<{
+      type?: string;
+      media?: { image?: { src?: string } };
+      media_type?: string;
+      url?: string;
+      subattachments?: {
+        data?: Array<{ media?: { image?: { src?: string } } }>;
+      };
+    }>;
+  };
   comments?: {
     summary?: { total_count?: number; can_comment?: boolean };
   };
   commentsCount?: number;
 };
+
+function facebookPostThumb(post: FacebookPagePost): string | null {
+  if (post.full_picture) return post.full_picture;
+  if (post.picture) return post.picture;
+  const attachment = post.attachments?.data?.[0];
+  const fromAttachment =
+    attachment?.media?.image?.src ??
+    attachment?.subattachments?.data?.[0]?.media?.image?.src ??
+    null;
+  return fromAttachment;
+}
 
 export type FacebookPostComment = {
   id: string;
@@ -296,20 +320,50 @@ export async function getFacebookPostCommentCount(
 export async function listFacebookPagePosts(
   accessToken: string,
   pageId: string,
-  limit = 24
+  limit = 40
 ): Promise<FacebookPagePost[]> {
-  const url = new URL(`${facebookGraphBase()}/${pageId}/posts`);
-  url.searchParams.set(
-    "fields",
-    "id,message,created_time,permalink_url,full_picture,comments.summary(true).limit(0)"
-  );
-  url.searchParams.set("limit", String(limit));
-  url.searchParams.set("access_token", accessToken);
+  const fields =
+    "id,message,created_time,permalink_url,full_picture,picture,status_type,attachments{media,type,url,subattachments},comments.summary(true).limit(0)";
 
-  const response = await fetch(url.toString());
-  const data = await handleResponse<{ data?: FacebookPagePost[] }>(response);
-  return (data.data ?? []).map((post) => ({
-    ...post,
-    commentsCount: post.comments?.summary?.total_count ?? 0,
-  }));
+  async function fetchEdge(edge: "published_posts" | "posts" | "feed") {
+    const url = new URL(`${facebookGraphBase()}/${pageId}/${edge}`);
+    url.searchParams.set("fields", fields);
+    url.searchParams.set("limit", String(Math.min(100, Math.max(1, limit))));
+    url.searchParams.set("access_token", accessToken);
+    const response = await fetch(url.toString());
+    const data = await handleResponse<{ data?: FacebookPagePost[] }>(response);
+    return data.data ?? [];
+  }
+
+  // published_posts = Page's own content; fall back to posts/feed when empty
+  // (some tokens only return data on one of these edges).
+  let rows: FacebookPagePost[] = [];
+  try {
+    rows = await fetchEdge("published_posts");
+  } catch {
+    rows = [];
+  }
+  if (rows.length === 0) {
+    try {
+      rows = await fetchEdge("posts");
+    } catch {
+      rows = [];
+    }
+  }
+  if (rows.length === 0) {
+    rows = await fetchEdge("feed");
+  }
+
+  const seen = new Set<string>();
+  return rows
+    .filter((post) => {
+      if (!post.id || seen.has(post.id)) return false;
+      seen.add(post.id);
+      return true;
+    })
+    .map((post) => ({
+      ...post,
+      full_picture: facebookPostThumb(post) ?? post.full_picture ?? null,
+      commentsCount: post.comments?.summary?.total_count ?? 0,
+    }));
 }
