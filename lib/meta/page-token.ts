@@ -67,12 +67,43 @@ export async function canReadInstagramMedia(
   }
 }
 
+type IgAccountRef = { id?: string; username?: string };
+
 type PageWithTokens = {
   id: string;
   name?: string;
   access_token?: string;
-  instagram_business_account?: { id?: string; username?: string };
+  instagram_business_account?: IgAccountRef;
+  /** New Pages Experience often puts IG here instead of instagram_business_account. */
+  connected_instagram_account?: IgAccountRef;
 };
+
+/**
+ * Prefer classic IG business field; fall back to connected_instagram_account
+ * (پیشروان / @pishravancom has null business + live connected).
+ */
+export function pickInstagramFromPage(page: {
+  instagram_business_account?: IgAccountRef | null;
+  connected_instagram_account?: IgAccountRef | null;
+}): { id: string; username?: string; source: string } | null {
+  const bizId = page.instagram_business_account?.id?.trim();
+  if (bizId) {
+    return {
+      id: bizId,
+      username: page.instagram_business_account?.username?.trim(),
+      source: "instagram_business_account",
+    };
+  }
+  const connectedId = page.connected_instagram_account?.id?.trim();
+  if (connectedId) {
+    return {
+      id: connectedId,
+      username: page.connected_instagram_account?.username?.trim(),
+      source: "connected_instagram_account",
+    };
+  }
+  return null;
+}
 
 /**
  * Load Page-scoped tokens via /me/accounts.
@@ -84,7 +115,7 @@ export async function listPagesWithAccessTokens(
   const url = new URL(`${facebookGraphBase()}/me/accounts`);
   url.searchParams.set(
     "fields",
-    "id,name,access_token,instagram_business_account{id,username}"
+    "id,name,access_token,instagram_business_account{id,username},connected_instagram_account{id,username}"
   );
   url.searchParams.set("limit", "100");
   url.searchParams.set("access_token", accessToken);
@@ -168,9 +199,7 @@ export async function resolveInstagramMediaAccessToken(opts: {
     try {
       const pages = await listPagesWithAccessTokens(su);
       const match =
-        pages.find(
-          (p) => p.instagram_business_account?.id === opts.instagramId
-        ) ??
+        pages.find((p) => pickInstagramFromPage(p)?.id === opts.instagramId) ??
         (opts.facebookPageId
           ? pages.find((p) => p.id === opts.facebookPageId)
           : undefined);
@@ -200,9 +229,9 @@ export async function mapInstagramIdsToPageTokens(
   try {
     const pages = await listPagesWithAccessTokens(accessToken);
     for (const page of pages) {
-      const igId = page.instagram_business_account?.id;
+      const ig = pickInstagramFromPage(page);
       const pageToken = page.access_token?.trim();
-      if (igId && pageToken) map.set(igId, pageToken);
+      if (ig?.id && pageToken) map.set(ig.id, pageToken);
     }
   } catch (error) {
     console.warn(
@@ -232,12 +261,13 @@ export async function listLiveInstagramLinks(
     const pages = await listPagesWithAccessTokens(token);
     const links: LiveInstagramLink[] = [];
     for (const page of pages) {
-      const igId = page.instagram_business_account?.id?.trim();
-      const username = page.instagram_business_account?.username?.trim();
+      const ig = pickInstagramFromPage(page);
       const pageToken = page.access_token?.trim();
-      if (!igId || !username || !pageToken || !page.id) continue;
+      // Username can be missing on some edges; fall back to page name for rematch.
+      const username = (ig?.username || page.name || "").replace(/^@/, "").trim();
+      if (!ig?.id || !username || !pageToken || !page.id) continue;
       links.push({
-        instagramId: igId,
+        instagramId: ig.id,
         username,
         pageId: page.id,
         pageName: page.name ?? page.id,
@@ -338,13 +368,21 @@ export async function fetchInstagramLinkedToFacebookPageDetailed(opts: {
   const tokenKind = await inspectTokenKind(opts.pageAccessToken);
   probes.push({ step: "token_kind", tokenKind, pageId: opts.pageId });
 
-  const tryParseIg = (
+  const acceptIfReadable = async (
     source: string,
     ig?: { id?: string; username?: string } | null,
     pageId?: string
-  ): FacebookPageIgLookup | null => {
+  ): Promise<FacebookPageIgLookup | null> => {
     const igId = ig?.id?.trim();
     if (!igId) return null;
+    const canRead = await canReadInstagramMedia(opts.pageAccessToken, igId);
+    probes.push({
+      step: "verify_media",
+      source,
+      igId,
+      canRead,
+    });
+    if (!canRead) return null;
     return {
       instagramId: igId,
       username: ig?.username,
@@ -354,43 +392,48 @@ export async function fetchInstagramLinkedToFacebookPageDetailed(opts: {
     };
   };
 
-  // 1) Classic Page field
+  // 1) Classic + connected in one call (پیشروان only has connected).
   try {
     const url = new URL(`${facebookGraphBase()}/${opts.pageId}`);
     url.searchParams.set(
       "fields",
-      "id,name,instagram_business_account{id,username}"
+      "id,name,instagram_business_account{id,username},connected_instagram_account{id,username}"
     );
     url.searchParams.set("access_token", opts.pageAccessToken);
     const page = await graphGet<{
       id?: string;
       name?: string;
       instagram_business_account?: { id?: string; username?: string };
+      connected_instagram_account?: { id?: string; username?: string };
     }>(url);
+    const picked = pickInstagramFromPage(page);
     probes.push({
-      step: "instagram_business_account",
+      step: "page_ig_fields",
       ok: true,
       pageGraphId: page.id,
       pageName: page.name,
-      hasIg: Boolean(page.instagram_business_account?.id),
-      igId: page.instagram_business_account?.id ?? null,
-      igUsername: page.instagram_business_account?.username ?? null,
+      businessId: page.instagram_business_account?.id ?? null,
+      connectedId: page.connected_instagram_account?.id ?? null,
+      picked: picked?.id ?? null,
+      pickedSource: picked?.source ?? null,
     });
-    const linked = tryParseIg(
-      "instagram_business_account",
-      page.instagram_business_account,
-      page.id
-    );
-    if (linked) return { linked, probes, tokenKind };
+    if (picked) {
+      const linked = await acceptIfReadable(
+        picked.source,
+        { id: picked.id, username: picked.username },
+        page.id
+      );
+      if (linked) return { linked, probes, tokenKind };
+    }
   } catch (error) {
     probes.push({
-      step: "instagram_business_account",
+      step: "page_ig_fields",
       ok: false,
       error: error instanceof Error ? error.message : String(error),
     });
   }
 
-  // 2) Page-backed IG accounts edge (common for New Pages Experience)
+  // 2) page_backed — last resort; often returns an id that cannot read /media.
   try {
     const url = new URL(
       `${facebookGraphBase()}/${opts.pageId}/page_backed_instagram_accounts`
@@ -408,7 +451,10 @@ export async function fetchInstagramLinkedToFacebookPageDetailed(opts: {
       firstId: first?.id ?? null,
       firstUsername: first?.username ?? null,
     });
-    const linked = tryParseIg("page_backed_instagram_accounts", first);
+    const linked = await acceptIfReadable(
+      "page_backed_instagram_accounts",
+      first
+    );
     if (linked) return { linked, probes, tokenKind };
   } catch (error) {
     probes.push({
@@ -418,39 +464,6 @@ export async function fetchInstagramLinkedToFacebookPageDetailed(opts: {
     });
   }
 
-  // 3) connected_instagram_account
-  try {
-    const url = new URL(`${facebookGraphBase()}/${opts.pageId}`);
-    url.searchParams.set(
-      "fields",
-      "id,name,connected_instagram_account{id,username}"
-    );
-    url.searchParams.set("access_token", opts.pageAccessToken);
-    const page = await graphGet<{
-      id?: string;
-      connected_instagram_account?: { id?: string; username?: string };
-    }>(url);
-    probes.push({
-      step: "connected_instagram_account",
-      ok: true,
-      hasIg: Boolean(page.connected_instagram_account?.id),
-      igId: page.connected_instagram_account?.id ?? null,
-    });
-    const linked = tryParseIg(
-      "connected_instagram_account",
-      page.connected_instagram_account,
-      page.id
-    );
-    if (linked) return { linked, probes, tokenKind };
-  } catch (error) {
-    probes.push({
-      step: "connected_instagram_account",
-      ok: false,
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
-
-  // 4) If token looks like System User, explain why Page IG lookup fails.
   if (tokenKind === "system_user_or_user") {
     probes.push({
       step: "diagnosis",

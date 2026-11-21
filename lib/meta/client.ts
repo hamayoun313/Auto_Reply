@@ -131,17 +131,20 @@ export async function discoverUnifiedInstagramAccounts(
     const pagesUrl = new URL(`${facebookGraphBase()}/me/accounts`);
     pagesUrl.searchParams.set(
       "fields",
-      "id,name,instagram_business_account{id,username,name}"
+      "id,name,instagram_business_account{id,username,name},connected_instagram_account{id,username,name}"
     );
     pagesUrl.searchParams.set("access_token", accessToken);
     const pagesRes = await fetch(pagesUrl.toString());
     const pages = await handleResponse<{
       data?: Array<{
         instagram_business_account?: AssignedInstagramAccount;
+        connected_instagram_account?: AssignedInstagramAccount;
       }>;
     }>(pagesRes);
     const fromPages = (pages.data ?? [])
-      .map((p) => p.instagram_business_account)
+      .map(
+        (p) => p.instagram_business_account ?? p.connected_instagram_account
+      )
       .filter((a): a is AssignedInstagramAccount => Boolean(a?.id));
     if (fromPages.length > 0) {
       console.info(
