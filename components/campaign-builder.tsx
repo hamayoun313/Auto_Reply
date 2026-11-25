@@ -1012,66 +1012,24 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
         </div>
       )}
 
-      {/* Top bar */}
-      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
-        <div className="flex min-w-0 items-center gap-3">
-          {mode === "edit" ? (
-            <>
-              <span className="truncate text-sm font-semibold text-foreground">
-                {name || t("Untitled campaign")}
-              </span>
-              <span
-                className={`rounded px-2 py-0.5 text-xs font-semibold ${
-                  isActive ? "bg-success/15 text-success" : "bg-zinc-500/15 text-muted"
-                }`}
-              >
-                {isActive ? t("LIVE") : t("PAUSED")}
-              </span>
-            </>
-          ) : (
-            <span className="text-sm text-muted">{t("New campaign")}</span>
-          )}
-        </div>
-        <div className="ml-auto flex items-center gap-2">
-          {importQueue && (
-            <button
-              type="button"
-              onClick={skipRow}
-              disabled={saving}
-              className="rounded-lg border border-border px-4 py-2 text-sm font-medium text-muted hover:text-foreground disabled:opacity-50"
+      {/* Top bar — status only; primary actions sit at the bottom for mobile */}
+      <div className="flex min-w-0 flex-wrap items-center gap-3">
+        {mode === "edit" ? (
+          <>
+            <span className="truncate text-sm font-semibold text-foreground">
+              {name || t("Untitled campaign")}
+            </span>
+            <span
+              className={`rounded px-2 py-0.5 text-xs font-semibold ${
+                isActive ? "bg-success/15 text-success" : "bg-zinc-500/15 text-muted"
+              }`}
             >
-              {importQueue.length > 1 ? t("Skip") : t("Skip & finish")}
-            </button>
-          )}
-          {mode === "edit" &&
-            (isActive ? (
-              <button
-                type="button"
-                onClick={() => handleSubmit(false)}
-                disabled={saving}
-                className="rounded-lg border border-border px-4 py-2 text-sm font-medium text-muted hover:text-foreground disabled:opacity-50"
-              >
-                {t("Stop")}
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={() => handleSubmit(true)}
-                disabled={saving}
-                className="rounded-lg border border-border px-4 py-2 text-sm font-medium text-muted hover:text-foreground disabled:opacity-50"
-              >
-                {t("Go Live")}
-              </button>
-            ))}
-          <button
-            type="button"
-            onClick={() => handleSubmit(mode === "new" ? true : isActive)}
-            disabled={saving}
-            className="rounded-lg bg-accent px-5 py-2 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-50"
-          >
-            {saving ? t("Saving…") : mode === "new" ? t("Go Live") : t("Save changes")}
-          </button>
-        </div>
+              {isActive ? t("LIVE") : t("PAUSED")}
+            </span>
+          </>
+        ) : (
+          <span className="text-sm text-muted">{t("New campaign")}</span>
+        )}
       </div>
 
       {/* min-w-0 on the cells: a grid item defaults to min-width:auto, so a
@@ -1787,6 +1745,50 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
           />
         </div>
       </div>
+      </div>
+
+      {/* Bottom actions — thumb-reach on phones after finishing the form */}
+      <div className="sticky bottom-0 z-20 -mx-1 border-t border-border bg-background/95 px-1 py-3 backdrop-blur supports-[backdrop-filter]:bg-background/80">
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          {importQueue && (
+            <button
+              type="button"
+              onClick={skipRow}
+              disabled={saving}
+              className="rounded-lg border border-border px-4 py-2.5 text-sm font-medium text-muted hover:text-foreground disabled:opacity-50"
+            >
+              {importQueue.length > 1 ? t("Skip") : t("Skip & finish")}
+            </button>
+          )}
+          {mode === "edit" &&
+            (isActive ? (
+              <button
+                type="button"
+                onClick={() => handleSubmit(false)}
+                disabled={saving}
+                className="rounded-lg border border-border px-4 py-2.5 text-sm font-medium text-muted hover:text-foreground disabled:opacity-50"
+              >
+                {t("Stop")}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => handleSubmit(true)}
+                disabled={saving}
+                className="rounded-lg border border-border px-4 py-2.5 text-sm font-medium text-muted hover:text-foreground disabled:opacity-50"
+              >
+                {t("Go Live")}
+              </button>
+            ))}
+          <button
+            type="button"
+            onClick={() => handleSubmit(mode === "new" ? true : isActive)}
+            disabled={saving}
+            className="rounded-lg bg-accent px-5 py-2.5 text-sm font-medium text-white hover:bg-accent-hover disabled:opacity-50"
+          >
+            {saving ? t("Saving…") : mode === "new" ? t("Go Live") : t("Save changes")}
+          </button>
+        </div>
       </div>
     </div>
   );

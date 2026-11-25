@@ -8,7 +8,11 @@
 
 import { useI18n } from "@/lib/i18n/provider";
 import { useEffect, useState, useCallback } from "react";
-import AccountSelect, { type AccountOption } from "@/components/account-select";
+import AccountSelect, {
+  type AccountOption,
+  type FacebookPageOption,
+} from "@/components/account-select";
+import { parseBrandSelectValue } from "@/lib/brand-pages";
 import StatusBadge from "@/components/status-badge";
 
 interface DmLog {
@@ -62,15 +66,20 @@ export default function LogsPage() {
   // Default to Sent — Facebook commenter names resolve after DM send.
   const [statusFilter, setStatusFilter] = useState("SENT");
   const [accounts, setAccounts] = useState<AccountOption[]>([]);
-  const [selectedAccountId, setSelectedAccountId] = useState("all");
+  const [facebookPages, setFacebookPages] = useState<FacebookPageOption[]>([]);
+  const [selectedBrandKey, setSelectedBrandKey] = useState("all");
   const [page, setPage] = useState(1);
 
   const fetchLogs = useCallback(async () => {
     try {
       const params = new URLSearchParams({ page: String(page), limit: "20" });
       if (statusFilter !== "ALL") params.set("status", statusFilter);
-      if (selectedAccountId !== "all") {
-        params.set("instagramAccountId", selectedAccountId);
+      const brand = parseBrandSelectValue(selectedBrandKey);
+      if (brand.instagramAccountId) {
+        params.set("instagramAccountId", brand.instagramAccountId);
+      }
+      if (brand.facebookPageId) {
+        params.set("facebookPageId", brand.facebookPageId);
       }
 
       const res = await fetch(`/api/logs?${params}`);
@@ -84,13 +93,16 @@ export default function LogsPage() {
     } finally {
       setLoading(false);
     }
-  }, [page, statusFilter, selectedAccountId]);
+  }, [page, statusFilter, selectedBrandKey]);
 
   useEffect(() => {
     fetch("/api/dashboard/stats")
       .then((res) => res.json())
       .then((payload) => {
-        if (payload.success) setAccounts(payload.data.instagramAccounts ?? []);
+        if (payload.success) {
+          setAccounts(payload.data.instagramAccounts ?? []);
+          setFacebookPages(payload.data.facebookPages ?? []);
+        }
       })
       .catch(console.error);
   }, []);
@@ -108,11 +120,13 @@ export default function LogsPage() {
     setPage(1);
   }
 
-  function handleAccountChange(accountId: string) {
+  function handleBrandChange(brandKey: string) {
     setLoading(true);
-    setSelectedAccountId(accountId);
+    setSelectedBrandKey(brandKey);
     setPage(1);
   }
+
+  const connectedCount = accounts.length + facebookPages.length;
 
   return (
     <div className="space-y-6">
@@ -141,11 +155,12 @@ export default function LogsPage() {
             </button>
           ))}
         </div>
-        {accounts.length > 1 && (
+        {connectedCount > 1 && (
           <AccountSelect
             accounts={accounts}
-            value={selectedAccountId}
-            onChange={handleAccountChange}
+            facebookPages={facebookPages}
+            value={selectedBrandKey}
+            onChange={handleBrandChange}
           />
         )}
       </div>

@@ -20,18 +20,38 @@ export async function GET(request: NextRequest) {
   );
   const status = searchParams.get("status");
   const instagramAccountId = searchParams.get("instagramAccountId");
+  const facebookPageId = searchParams.get("facebookPageId");
   const skip = (page - 1) * limit;
   const parsedStatus =
     status && Object.values(DmStatus).includes(status as DmStatus)
       ? (status as DmStatus)
       : null;
 
+  const selectedIg =
+    instagramAccountId && instagramAccountId !== "all"
+      ? instagramAccountId
+      : null;
+  const selectedFb =
+    facebookPageId && facebookPageId !== "all" ? facebookPageId : null;
+  // Brand select: when both IDs are present, include FB + IG logs together.
+  const accountFilter =
+    selectedIg && selectedFb
+      ? {
+          OR: [
+            { instagramAccountId: selectedIg },
+            { facebookPageId: selectedFb },
+          ],
+        }
+      : selectedIg
+        ? { instagramAccountId: selectedIg }
+        : selectedFb
+          ? { facebookPageId: selectedFb }
+          : {};
+
   const where = {
     workspaceId,
     ...(parsedStatus ? { status: parsedStatus } : {}),
-    ...(instagramAccountId && instagramAccountId !== "all"
-      ? { instagramAccountId }
-      : {}),
+    ...accountFilter,
   };
 
   const [logs, total] = await Promise.all([
