@@ -89,40 +89,61 @@ export async function processFacebookComment(
     ...(alternateMediaIds ?? []),
   ].filter(Boolean);
 
-  const automations = await prisma.automation.findMany({
-    where: {
-      ...(job.data.accountConnectionId
-        ? { facebookPageId: job.data.accountConnectionId }
-        : {}),
-      OR: [
-        ...postIds.map((id) => ({ postId: id })),
-        ...postIds.map((id) => ({ postIds: { has: id } })),
-        { matchAnyPost: true },
-      ],
-      isActive: true,
-      facebookPage: { pageId: facebookPageId },
+  const fbInclude = {
+    facebookPage: true,
+    workspace: true,
+    trackedLinks: {
+      select: { slug: true, label: true, destinationUrl: true },
+      orderBy: TRACKED_LINK_ORDER,
     },
-    include: {
-      facebookPage: true,
-      workspace: true,
-      trackedLinks: {
-        select: { slug: true, label: true, destinationUrl: true },
-        orderBy: TRACKED_LINK_ORDER,
+  } as const;
+
+  const pinnedAutomationId = job.data.automationId;
+  let automations = pinnedAutomationId
+    ? await prisma.automation.findMany({
+        where: {
+          id: pinnedAutomationId,
+          isActive: true,
+          facebookPage: { pageId: facebookPageId },
+        },
+        include: fbInclude,
+      })
+    : [];
+
+  if (automations.length === 0) {
+    automations = await prisma.automation.findMany({
+      where: {
+        ...(job.data.accountConnectionId
+          ? { facebookPageId: job.data.accountConnectionId }
+          : {}),
+        OR: [
+          ...postIds.map((id) => ({ postId: id })),
+          ...postIds.map((id) => ({ postIds: { has: id } })),
+          { matchAnyPost: true },
+        ],
+        isActive: true,
+        facebookPage: { pageId: facebookPageId },
       },
-    },
-    orderBy: { createdAt: "asc" },
-  });
+      include: fbInclude,
+      orderBy: { createdAt: "asc" },
+    });
+  }
+  let actedOnPending = false;
 
   for (const automation of automations) {
     if (!automation.facebookPage || !automation.facebookPageId) continue;
 
-    const matchResult = automation.matchAnyWord
-      ? { matched: true, matchedKeyword: null }
-      : matchKeywords(
-          commentText,
-          automation.keywords,
-          automation.wholeWordMatch
-        );
+    // Orphan PENDING requeue already matched — don't no-op on keyword re-check.
+    const matchResult =
+      pinnedAutomationId && automation.id === pinnedAutomationId
+        ? { matched: true as const, matchedKeyword: null as string | null }
+        : automation.matchAnyWord
+          ? { matched: true as const, matchedKeyword: null as string | null }
+          : matchKeywords(
+              commentText,
+              automation.keywords,
+              automation.wholeWordMatch
+            );
     if (!matchResult.matched) continue;
 
     const existingLog = await prisma.dmLog.findUnique({
@@ -488,9 +509,26 @@ export async function processFacebookComment(
           usagePeriodStart
         );
       }
+      actedOnPending = true;
       throw classified;
     } finally {
       if (rateLimit?.reserved) await releaseDMSlot(facebookPageId);
     }
+    actedOnPending = true;
+  }
+
+  if (!actedOnPending) {
+    await prisma.dmLog.updateMany({
+      where: {
+        commentId,
+        status: "PENDING",
+        facebookPage: { pageId: facebookPageId },
+      },
+      data: {
+        attempts: { increment: 1 },
+        errorMessage:
+          "Worker pass completed without send (no matching Facebook campaign for media/page)",
+      },
+    });
   }
 }

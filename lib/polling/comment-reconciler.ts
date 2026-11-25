@@ -238,6 +238,7 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
       commenterName: true,
       automation: {
         select: {
+          id: true,
           postId: true,
           postIds: true,
           instagramAccount: {
@@ -265,12 +266,24 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
     const fb = row.automation.facebookPage;
 
     if (fb?.pageId) {
+      const jobId = `fb_pending_${fb.pageId}_${row.commentId}`;
+      const existing = await queue.getJob(jobId);
+      if (existing) {
+        const state = await existing.getState();
+        if (state === "completed" || state === "failed") {
+          await existing.remove().catch(() => {});
+        } else {
+          // Already waiting/active/delayed — do not stack another copy.
+          continue;
+        }
+      }
       await queue.add(
         "process-comment",
         {
           channel: "facebook",
           facebookPageId: fb.pageId,
           accountConnectionId: fb.id,
+          automationId: row.automation.id,
           commentId: row.commentId,
           commentText: row.commentText,
           commenterId: row.commenterId,
@@ -280,7 +293,7 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
         },
         {
           delay: enqueued * Math.max(0, pacingMs),
-          jobId: `fb_pending_${fb.pageId}_${row.commentId}`,
+          jobId,
         }
       );
       enqueued += 1;
@@ -288,11 +301,22 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
     }
 
     if (!ig) continue;
+    const jobId = `ig_pending_${ig.instagramId}_${row.commentId}`;
+    const existing = await queue.getJob(jobId);
+    if (existing) {
+      const state = await existing.getState();
+      if (state === "completed" || state === "failed") {
+        await existing.remove().catch(() => {});
+      } else {
+        continue;
+      }
+    }
     await queue.add(
       "process-comment",
       {
         instagramAccountId: ig.instagramId,
         accountConnectionId: ig.id,
+        automationId: row.automation.id,
         commentId: row.commentId,
         commentText: row.commentText,
         commenterId: row.commenterId,
@@ -302,7 +326,7 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
       },
       {
         delay: enqueued * Math.max(0, pacingMs),
-        jobId: `ig_pending_${ig.instagramId}_${row.commentId}`,
+        jobId,
       }
     );
     enqueued += 1;

@@ -317,6 +317,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     commenterName,
     mediaId,
     originalMediaId,
+    automationId,
   } = job.data;
   const requeueAttempt = job.data.requeueAttempt ?? 0;
 
@@ -324,42 +325,79 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     throw new Error("instagramAccountId required for Instagram comment jobs");
   }
 
-  const automationsRaw = await prisma.automation.findMany({
-    where: {
-      ...connectionScope(job.data),
-      // Match campaigns bound to this specific post, plus any-post campaigns.
-      // A comment left on an ad carries the ad's own media id, while the
-      // campaign is bound to the post the ad was created from, so both ids
-      // have to be considered or the comment is dropped without a trace.
-      OR: [
-        { postId: mediaId },
-        ...(originalMediaId ? [{ postId: originalMediaId }] : []),
-        { postIds: { has: mediaId } },
-        ...(originalMediaId
-          ? [{ postIds: { has: originalMediaId } }]
-          : []),
-        { matchAnyPost: true },
-      ],
-      isActive: true,
-      facebookPageId: null,
-      instagramAccount: {
-        instagramId: instagramAccountId,
+  const automationInclude = {
+    instagramAccount: true,
+    workspace: true,
+    trackedLinks: {
+      select: {
+        slug: true,
+        label: true,
+        destinationUrl: true,
       },
+      orderBy: TRACKED_LINK_ORDER,
     },
-    include: {
-      instagramAccount: true,
-      workspace: true,
-      trackedLinks: {
-        select: {
-          slug: true,
-          label: true,
-          destinationUrl: true,
+  } as const;
+
+  // Orphan PENDING requeue pins the exact campaign. Prefer that row so a
+  // mediaId mismatch cannot no-op the job and leave DmLog stuck forever.
+  const automationsRaw = automationId
+    ? await prisma.automation
+        .findMany({
+          where: {
+            id: automationId,
+            isActive: true,
+            facebookPageId: null,
+            instagramAccount: { instagramId: instagramAccountId },
+          },
+          include: automationInclude,
+        })
+        .then(async (pinned) => {
+          if (pinned.length > 0) return pinned;
+          return prisma.automation.findMany({
+            where: {
+              ...connectionScope(job.data),
+              OR: [
+                { postId: mediaId },
+                ...(originalMediaId ? [{ postId: originalMediaId }] : []),
+                { postIds: { has: mediaId } },
+                ...(originalMediaId
+                  ? [{ postIds: { has: originalMediaId } }]
+                  : []),
+                { matchAnyPost: true },
+              ],
+              isActive: true,
+              facebookPageId: null,
+              instagramAccount: { instagramId: instagramAccountId },
+            },
+            include: automationInclude,
+            orderBy: { createdAt: "asc" },
+          });
+        })
+    : await prisma.automation.findMany({
+        where: {
+          ...connectionScope(job.data),
+          // Match campaigns bound to this specific post, plus any-post campaigns.
+          // A comment left on an ad carries the ad's own media id, while the
+          // campaign is bound to the post the ad was created from, so both ids
+          // have to be considered or the comment is dropped without a trace.
+          OR: [
+            { postId: mediaId },
+            ...(originalMediaId ? [{ postId: originalMediaId }] : []),
+            { postIds: { has: mediaId } },
+            ...(originalMediaId
+              ? [{ postIds: { has: originalMediaId } }]
+              : []),
+            { matchAnyPost: true },
+          ],
+          isActive: true,
+          facebookPageId: null,
+          instagramAccount: {
+            instagramId: instagramAccountId,
+          },
         },
-        orderBy: TRACKED_LINK_ORDER,
-      },
-    },
-    orderBy: { createdAt: "asc" },
-  });
+        include: automationInclude,
+        orderBy: { createdAt: "asc" },
+      });
   const automations = automationsRaw.filter(
     (
       a
@@ -369,15 +407,20 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     } => Boolean(a.instagramAccount && a.instagramAccountId)
   );
 
+  let actedOnPending = false;
   for (const automation of automations) {
-    // "Any word" campaigns fire on every comment; otherwise require a keyword hit.
-    const matchResult = automation.matchAnyWord
-      ? { matched: true, matchedKeyword: null }
-      : matchKeywords(
-          commentText,
-          automation.keywords,
-          automation.wholeWordMatch
-        );
+    // Orphan PENDING requeue already matched when the DmLog was created — do not
+    // drop the job on a second keyword pass (that left 24 rows stuck forever).
+    const matchResult =
+      automationId && automation.id === automationId
+        ? { matched: true as const, matchedKeyword: null as string | null }
+        : automation.matchAnyWord
+          ? { matched: true as const, matchedKeyword: null as string | null }
+          : matchKeywords(
+              commentText,
+              automation.keywords,
+              automation.wholeWordMatch
+            );
 
     if (!matchResult.matched) {
       continue;
@@ -575,6 +618,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           errorMessage: `Another campaign (${privateReplyUsedBy.automation?.name ?? "unknown"}) already sent the one private reply Instagram allows for this comment`,
         },
       });
+      actedOnPending = true;
       continue;
     }
 
@@ -593,6 +637,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           errorMessage: `Monthly DM limit reached (${usage.limit})`,
         },
       });
+      actedOnPending = true;
       continue;
     }
 
@@ -639,6 +684,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
             errorMessage: "Hourly Instagram DM rate limit reached",
           },
         });
+        actedOnPending = true;
         continue;
       }
 
@@ -668,6 +714,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
             jobId: `comment_${instagramAccountId}_${commentId}_retry_${requeueAttempt + 1}`,
           }
         );
+        actedOnPending = true;
         continue;
       }
     }
@@ -845,8 +892,27 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           dmDeliveryUnconfirmed: isDeliveryUnconfirmed(sendError),
         },
       });
+      actedOnPending = true;
       throw sendError;
     }
+    actedOnPending = true;
+  }
+
+  // Job "completed" with zero DmLog transitions → bump attempts so orphan
+  // requeue cannot spin the same rows forever.
+  if (!actedOnPending) {
+    await prisma.dmLog.updateMany({
+      where: {
+        commentId,
+        status: "PENDING",
+        instagramAccount: { instagramId: instagramAccountId },
+      },
+      data: {
+        attempts: { increment: 1 },
+        errorMessage:
+          "Worker pass completed without send (no matching campaign for media/account)",
+      },
+    });
   }
 }
 

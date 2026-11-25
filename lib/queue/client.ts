@@ -36,6 +36,8 @@ export interface ProcessCommentJob {
   commentText: string;
   commenterId: string;
   commenterName?: string;
+  /** When set (orphan PENDING requeue), process this campaign first. */
+  automationId?: string;
   mediaId: string;
   // Set when the comment came from an ad: the organic post the ad was made
   // from. Campaigns are bound to that post, so both ids have to be matched.
