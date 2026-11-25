@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  isPermanentCommentRejection,
+  isPermanentFailureMessage,
+} from "../lib/instagram/delivery-errors";
+import {
   MetaApiError,
   PermissionError,
   RateLimitError,
@@ -35,5 +39,35 @@ describe("Meta API error classes", () => {
 
   it("stays a MetaApiError, which is how callers narrow it", () => {
     expect(new PermissionError("m", "t", 2534025)).toBeInstanceOf(MetaApiError);
+  });
+});
+
+describe("permanent comment send rejections", () => {
+  it("treats private-reply window / missing user as permanent", () => {
+    expect(
+      isPermanentCommentRejection(
+        new PermissionError(
+          "(#100) The comment is invalid for a private reply",
+          "t",
+          2534025
+        )
+      )
+    ).toBe(true);
+    expect(
+      isPermanentCommentRejection(
+        new PermissionError("The requested user cannot be found.", "t", 2534014)
+      )
+    ).toBe(true);
+    expect(
+      isPermanentFailureMessage(
+        "PermissionError 100: (#100) The comment is invalid for a private reply [code=100 sub=2534025]"
+      )
+    ).toBe(true);
+  });
+
+  it("does not mark token expiry as a permanent comment rejection", () => {
+    expect(
+      isPermanentCommentRejection(new TokenExpiredError("Session has expired"))
+    ).toBe(false);
   });
 });

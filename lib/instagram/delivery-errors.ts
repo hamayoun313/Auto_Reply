@@ -40,6 +40,55 @@ export function isConfirmedSendRejection(error: unknown): boolean {
   );
 }
 
+/** Meta subcodes that will never succeed on retry for this comment. */
+const PERMANENT_COMMENT_SUBCODES = new Set([2534025, 2534014]);
+
+const PERMANENT_COMMENT_REJECTION = [
+  /invalid for a private reply/i,
+  /requested user cannot be found/i,
+  /Object with ID .+ does not exist/i,
+  /disabled access to Instagram Direct Messaging/i,
+  /can'?t reply to this activity/i,
+];
+
+/**
+ * Rejections that must stay FAILED and must not be reclaimed / requeued.
+ * Retrying them burns Meta quota and trips the app circuit (e.g. #100
+ * sub=2534025 — comment outside the private-reply window or already used).
+ */
+export function isPermanentCommentRejection(error: unknown): boolean {
+  if (error instanceof MetaApiError) {
+    if (
+      error.subcode != null &&
+      PERMANENT_COMMENT_SUBCODES.has(error.subcode)
+    ) {
+      return true;
+    }
+    if (PERMANENT_COMMENT_REJECTION.some((pattern) => pattern.test(error.message))) {
+      return true;
+    }
+  }
+  if (error instanceof Error) {
+    return PERMANENT_COMMENT_REJECTION.some((pattern) =>
+      pattern.test(error.message)
+    );
+  }
+  return false;
+}
+
+export function isPermanentFailureMessage(
+  errorMessage: string | null | undefined
+): boolean {
+  if (!errorMessage) return false;
+  if (PERMANENT_COMMENT_REJECTION.some((pattern) => pattern.test(errorMessage))) {
+    return true;
+  }
+  return (
+    /(?:sub(?:code)?[=:]?\s*)?2534025\b/i.test(errorMessage) ||
+    /(?:sub(?:code)?[=:]?\s*)?2534014\b/i.test(errorMessage)
+  );
+}
+
 /**
  * Transient transport failures (Wi-Fi drop, DNS blip, connection reset). These
  * must be retried by BullMQ — treating them as "maybe delivered" permanently

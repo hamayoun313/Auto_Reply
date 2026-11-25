@@ -3,7 +3,7 @@
  * Simpler than the IG path: text / link-button private reply + optional public reply.
  * Opening-DM postbacks and follow-gating are IG-only for now.
  */
-import { DelayedError, type Job } from "bullmq";
+import { DelayedError, UnrecoverableError, type Job } from "bullmq";
 import {
   getDMQueue,
   type ProcessCommentJob,
@@ -29,6 +29,8 @@ import {
   classifySendError,
   hasLegacyUnconfirmedDelivery,
   isDeliveryUnconfirmed,
+  isPermanentCommentRejection,
+  isPermanentFailureMessage,
 } from "@/lib/instagram/delivery-errors";
 import {
   getAppRateLimitState,
@@ -173,9 +175,13 @@ export async function processFacebookComment(
 
     const alreadyDmd = existingLog?.status === "SENT";
     const alreadyPublicReplied = Boolean(existingLog?.publicReplySentAt);
+    const permanentlyFailed =
+      existingLog?.status === "FAILED" &&
+      isPermanentFailureMessage(existingLog.errorMessage);
     const needsDm =
       !alreadyDmd &&
       !existingLog?.dmDeliveryUnconfirmed &&
+      !permanentlyFailed &&
       (existingLog?.attempts ?? 0) < MAX_COMMENT_SEND_ATTEMPTS;
 
     if (existingLog?.status === "SKIPPED_PLAN_LIMIT") continue;
@@ -485,6 +491,11 @@ export async function processFacebookComment(
 
       const classified = classifySendError(error);
       const unconfirmed = isDeliveryUnconfirmed(error);
+      const permanent = !unconfirmed && isPermanentCommentRejection(classified);
+      const errorMessage =
+        classified instanceof Error
+          ? classified.message
+          : String(classified);
       await prisma.dmLog.update({
         where: {
           automationId_commentId: {
@@ -497,10 +508,8 @@ export async function processFacebookComment(
           ...(unconfirmed
             ? { dmSentAt: new Date(), dmDeliveryUnconfirmed: true }
             : { dmDeliveryUnconfirmed: false }),
-          errorMessage:
-            classified instanceof Error
-              ? classified.message
-              : String(classified),
+          ...(permanent ? { attempts: MAX_COMMENT_SEND_ATTEMPTS } : {}),
+          errorMessage,
         },
       });
       if (workspaceReserved && !unconfirmed) {
@@ -510,6 +519,9 @@ export async function processFacebookComment(
         );
       }
       actedOnPending = true;
+      if (permanent) {
+        throw new UnrecoverableError(errorMessage);
+      }
       throw classified;
     } finally {
       if (rateLimit?.reserved) await releaseDMSlot(facebookPageId);

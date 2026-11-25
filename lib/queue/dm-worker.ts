@@ -3,6 +3,8 @@ import {
   hasLegacyUnconfirmedDelivery,
   isConfirmedSendRejection,
   isDeliveryUnconfirmed,
+  isPermanentCommentRejection,
+  isPermanentFailureMessage,
 } from "@/lib/instagram/delivery-errors";
 import {
   claimCommentDelivery,
@@ -445,7 +447,13 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
 
     const alreadyDmd = existingLog?.status === "SENT";
     const alreadyPublicReplied = Boolean(existingLog?.publicReplySentAt);
-    const needsDm = !alreadyDmd && !existingLog?.dmDeliveryUnconfirmed &&
+    const permanentlyFailed =
+      existingLog?.status === "FAILED" &&
+      isPermanentFailureMessage(existingLog.errorMessage);
+    const needsDm =
+      !alreadyDmd &&
+      !existingLog?.dmDeliveryUnconfirmed &&
+      !permanentlyFailed &&
       (existingLog?.attempts ?? 0) < MAX_COMMENT_SEND_ATTEMPTS;
 
     // Skip only when there is genuinely nothing left to do. A comment whose DM
@@ -883,16 +891,21 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         if (rateLimit?.reserved) await releaseDMSlot(instagramAccountId);
         await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
       }
+      const permanent = !delivered && isPermanentCommentRejection(sendError);
       await prisma.dmLog.update({
         where: { automationId_commentId: { automationId: automation.id, commentId } },
         data: {
           status: delivered ? "SENT" : "FAILED",
           ...(delivered ? { dmSentAt: new Date() } : {}),
+          ...(permanent ? { attempts: MAX_COMMENT_SEND_ATTEMPTS } : {}),
           errorMessage: formatError(sendError),
           dmDeliveryUnconfirmed: isDeliveryUnconfirmed(sendError),
         },
       });
       actedOnPending = true;
+      if (permanent) {
+        throw new UnrecoverableError(formatError(sendError));
+      }
       throw sendError;
     }
     actedOnPending = true;
@@ -1718,7 +1731,7 @@ async function processJob(job: Job<DmQueueJob>): Promise<void> {
     // formatError() takes unknown; isDeliveryUnconfirmed() is a type guard on
     // Error subclasses, but keep using formatError() for a consistent message
     // format across every UnrecoverableError thrown from this worker.
-    if (isDeliveryUnconfirmed(error))
+    if (isDeliveryUnconfirmed(error) || isPermanentCommentRejection(error))
       throw new UnrecoverableError(formatError(error));
     if (isMetaAppRateLimitError(error)) {
       const opened = await tripAppRateLimit(formatError(error));
