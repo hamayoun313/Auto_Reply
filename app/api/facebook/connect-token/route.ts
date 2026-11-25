@@ -55,7 +55,21 @@ export async function POST(request: NextRequest) {
   ];
 
   try {
-    const pages = await listFacebookPagesForToken(accessToken);
+    // Page-scoped tokens often cannot call /me/accounts ("could not be
+    // decrypted"). When the user already supplied pageId(s), skip listing and
+    // resolve each page directly.
+    let pages: DiscoverableFacebookPage[] = [];
+    try {
+      pages = await listFacebookPagesForToken(accessToken);
+    } catch (listError) {
+      if (requestedIds.length === 0) {
+        throw listError;
+      }
+      console.warn(
+        "[Facebook Token Connect] /me/accounts failed; falling back to pageId:",
+        listError instanceof Error ? listError.message : listError
+      );
+    }
 
     if (requestedIds.length === 0) {
       if (pages.length === 0) {
@@ -99,9 +113,10 @@ export async function POST(request: NextRequest) {
       if (!page) {
         page = await fetchFacebookPageById(accessToken, pageId);
       }
+      // Last resort: trust the pasted Page token + id (Graph list/debug can
+      // fail on some Page tokens even though messaging works).
       if (!page?.id) {
-        skipped.push({ pageId, reason: "not_found" });
-        continue;
+        page = { id: pageId, name: pageId, accessToken };
       }
 
       const result = await saveFacebookPageConnection({
@@ -109,7 +124,7 @@ export async function POST(request: NextRequest) {
         page: {
           id: page.id,
           name: page.name,
-          accessToken: page.accessToken,
+          accessToken: page.accessToken || accessToken,
         },
       });
 

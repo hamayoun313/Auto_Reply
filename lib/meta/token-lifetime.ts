@@ -94,6 +94,23 @@ export async function inspectTokenLifetime(
   };
 }
 
+async function probePageTokenWorks(accessToken: string): Promise<boolean> {
+  const version = getMetaGraphApiVersion();
+  const url = new URL(`https://graph.facebook.com/${version}/me`);
+  url.searchParams.set("fields", "id,name");
+  url.searchParams.set("access_token", accessToken);
+  try {
+    const response = await fetch(url.toString());
+    const json = (await response.json()) as {
+      id?: string;
+      error?: { message?: string };
+    };
+    return Boolean(response.ok && json.id && !json.error);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Expiry to store in DB. Rejects short-lived tokens so we never again stamp
  * a fake +60 days on a 1–2 hour Graph Explorer session token.
@@ -101,15 +118,27 @@ export async function inspectTokenLifetime(
 export async function resolveStoredTokenExpiry(
   accessToken: string
 ): Promise<Date | null> {
-  const life = await inspectTokenLifetime(accessToken);
-  if (!life.isValid) {
-    throw new Error("Meta reports this access token is not valid");
+  try {
+    const life = await inspectTokenLifetime(accessToken);
+    if (!life.isValid) {
+      throw new Error("Meta reports this access token is not valid");
+    }
+    if (life.isShortLived) {
+      throw new ShortLivedTokenError(life.expiresAt);
+    }
+    // Durable Page/System User tokens often have expires_at=0 (never). Store a
+    // ≥90-day sentinel for dashboards; Meta itself will not kill these hourly.
+    return life.expiresAt ?? new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
+  } catch (error) {
+    if (error instanceof ShortLivedTokenError) throw error;
+    // Some Page tokens fail debug_token with "could not be decrypted" even
+    // though /me and messaging work. Accept those when a light probe succeeds.
+    const message = error instanceof Error ? error.message : String(error);
+    if (/could not be decrypted/i.test(message)) {
+      if (await probePageTokenWorks(accessToken)) {
+        return new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
+      }
+    }
+    throw error;
   }
-  if (life.isShortLived) {
-    throw new ShortLivedTokenError(life.expiresAt);
-  }
-  // Durable Page/System User tokens often have expires_at=0. Keep a far
-  // sentinel so dashboards that expect a date still work; cron refresh skips
-  // null/far-future as needed.
-  return life.expiresAt ?? new Date(Date.now() + 60 * 24 * 60 * 60 * 1000);
 }
