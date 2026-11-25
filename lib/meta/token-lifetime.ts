@@ -94,21 +94,30 @@ export async function inspectTokenLifetime(
   };
 }
 
-async function probePageTokenWorks(accessToken: string): Promise<boolean> {
+async function probePageTokenWorks(
+  accessToken: string,
+  pageId?: string
+): Promise<boolean> {
   const version = getMetaGraphApiVersion();
-  const url = new URL(`https://graph.facebook.com/${version}/me`);
-  url.searchParams.set("fields", "id,name");
-  url.searchParams.set("access_token", accessToken);
-  try {
-    const response = await fetch(url.toString());
-    const json = (await response.json()) as {
-      id?: string;
-      error?: { message?: string };
-    };
-    return Boolean(response.ok && json.id && !json.error);
-  } catch {
-    return false;
+  const targets = pageId
+    ? [pageId, "me"]
+    : ["me"];
+  for (const target of targets) {
+    const url = new URL(`https://graph.facebook.com/${version}/${target}`);
+    url.searchParams.set("fields", "id,name");
+    url.searchParams.set("access_token", accessToken);
+    try {
+      const response = await fetch(url.toString());
+      const json = (await response.json()) as {
+        id?: string;
+        error?: { message?: string };
+      };
+      if (response.ok && json.id && !json.error) return true;
+    } catch {
+      // try next target
+    }
   }
+  return false;
 }
 
 /**
@@ -116,15 +125,17 @@ async function probePageTokenWorks(accessToken: string): Promise<boolean> {
  * a fake +60 days on a 1–2 hour Graph Explorer session token.
  */
 export async function resolveStoredTokenExpiry(
-  accessToken: string
+  accessToken: string,
+  opts?: { pageId?: string }
 ): Promise<Date | null> {
+  const pageId = opts?.pageId?.trim() || undefined;
   try {
     const life = await inspectTokenLifetime(accessToken);
     if (life.isShortLived) {
       throw new ShortLivedTokenError(life.expiresAt);
     }
     if (!life.isValid) {
-      if (await probePageTokenWorks(accessToken)) {
+      if (await probePageTokenWorks(accessToken, pageId)) {
         return new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
       }
       throw new Error("Meta reports this access token is not valid");
@@ -140,7 +151,7 @@ export async function resolveStoredTokenExpiry(
       /could not be decrypted/i.test(message) ||
       /not valid/i.test(message)
     ) {
-      if (await probePageTokenWorks(accessToken)) {
+      if (await probePageTokenWorks(accessToken, pageId)) {
         return new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
       }
     }

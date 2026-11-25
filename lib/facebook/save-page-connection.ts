@@ -56,7 +56,9 @@ export async function saveFacebookPageConnection(
 
   const encryptedToken = encryptToken(input.page.accessToken);
   // Real Meta lifetime — never stamp a fake +60 days on short-lived tokens.
-  const tokenExpiresAt = await resolveStoredTokenExpiry(input.page.accessToken);
+  const tokenExpiresAt = await resolveStoredTokenExpiry(input.page.accessToken, {
+    pageId: input.page.id,
+  });
   const data = {
     name: input.page.name,
     accessToken: encryptedToken,
