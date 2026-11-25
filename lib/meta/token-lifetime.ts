@@ -120,21 +120,26 @@ export async function resolveStoredTokenExpiry(
 ): Promise<Date | null> {
   try {
     const life = await inspectTokenLifetime(accessToken);
-    if (!life.isValid) {
-      throw new Error("Meta reports this access token is not valid");
-    }
     if (life.isShortLived) {
       throw new ShortLivedTokenError(life.expiresAt);
+    }
+    if (!life.isValid) {
+      if (await probePageTokenWorks(accessToken)) {
+        return new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
+      }
+      throw new Error("Meta reports this access token is not valid");
     }
     // Durable Page/System User tokens often have expires_at=0 (never). Store a
     // ≥90-day sentinel for dashboards; Meta itself will not kill these hourly.
     return life.expiresAt ?? new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
   } catch (error) {
     if (error instanceof ShortLivedTokenError) throw error;
-    // Some Page tokens fail debug_token with "could not be decrypted" even
-    // though /me and messaging work. Accept those when a light probe succeeds.
+    // Some Page tokens fail debug_token even though /me and messaging work.
     const message = error instanceof Error ? error.message : String(error);
-    if (/could not be decrypted/i.test(message)) {
+    if (
+      /could not be decrypted/i.test(message) ||
+      /not valid/i.test(message)
+    ) {
       if (await probePageTokenWorks(accessToken)) {
         return new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
       }
