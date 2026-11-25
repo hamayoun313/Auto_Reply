@@ -34,8 +34,8 @@ export async function reconcileFacebookComments(): Promise<void> {
 
   const queue = getDMQueue();
   const counts = await queue.getJobCounts("waiting", "active", "delayed");
-  const inflight =
-    (counts.waiting ?? 0) + (counts.active ?? 0) + (counts.delayed ?? 0);
+  // Delayed = pacing only; do not treat as live backlog for Graph skip.
+  const inflight = (counts.waiting ?? 0) + (counts.active ?? 0);
   const maxInflight = Number(process.env.COMMENT_POLL_SKIP_INFLIGHT_ABOVE ?? 25);
   // Leave headroom so a long-running backlog (Salamkar) cannot block Graph
   // reads for every other Page campaign forever.

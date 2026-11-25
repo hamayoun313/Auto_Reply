@@ -96,8 +96,9 @@ export async function reconcileComments(): Promise<void> {
   // hard-skip Graph when the shared queue is deeply backed up.
   const queue = getDMQueue();
   const counts = await queue.getJobCounts("waiting", "active", "delayed");
-  const inflight =
-    (counts.waiting ?? 0) + (counts.active ?? 0) + (counts.delayed ?? 0);
+  // Delayed jobs are intentional pacing — they must NOT freeze Graph polling
+  // or starve other accounts behind one campaign's backlog.
+  const inflight = (counts.waiting ?? 0) + (counts.active ?? 0);
   const maxInflight = Number(process.env.COMMENT_POLL_SKIP_INFLIGHT_ABOVE ?? 25);
   if (inflight >= maxInflight) {
     console.log(
@@ -222,7 +223,9 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
     data: { dmDeliveryUnconfirmed: false, errorMessage: null },
   });
 
-  const pending = await prisma.dmLog.findMany({
+  // Pull a wider window then round-robin by account so one Page (e.g. Appkhana
+  // FB) cannot monopolize every requeue sweep with the same oldest 24 rows.
+  const pendingPool = await prisma.dmLog.findMany({
     where: {
       status: "PENDING",
       dmDeliveryUnconfirmed: false,
@@ -230,7 +233,7 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
       automation: { isActive: true },
     },
     orderBy: { createdAt: "asc" },
-    take: MAX_NEW_PER_SWEEP,
+    take: Math.max(MAX_NEW_PER_SWEEP * 8, 80),
     select: {
       commentId: true,
       commentText: true,
@@ -251,6 +254,24 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
       },
     },
   });
+
+  const perAccountCap = Math.max(
+    2,
+    Math.ceil(MAX_NEW_PER_SWEEP / 5)
+  );
+  const takenByAccount = new Map<string, number>();
+  const pending: typeof pendingPool = [];
+  for (const row of pendingPool) {
+    const accountKey =
+      row.automation.instagramAccount?.id ??
+      row.automation.facebookPage?.id ??
+      row.automation.id;
+    const used = takenByAccount.get(accountKey) ?? 0;
+    if (used >= perAccountCap) continue;
+    takenByAccount.set(accountKey, used + 1);
+    pending.push(row);
+    if (pending.length >= MAX_NEW_PER_SWEEP) break;
+  }
 
   const pacingMs = Number(process.env.DM_SEND_PACING_MS ?? 30_000);
   let enqueued = 0;
@@ -333,13 +354,14 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
   }
 
   if (enqueued > 0) {
-    const debounceSec = Math.max(
+    // Cap debounce so a paced batch cannot freeze orphan drain for minutes.
+    const debounceSec = Math.min(
       60,
-      Math.ceil((enqueued * Math.max(1000, pacingMs)) / 1000)
+      Math.max(20, Math.ceil((enqueued * Math.max(1000, pacingMs)) / 1000))
     );
     await redis.set(debounceKey, "1", "EX", debounceSec);
     console.log(
-      `[Comment Poll] Requeued ${enqueued} orphaned PENDING from DB (waiting=${counts.waiting ?? 0} active=${counts.active ?? 0} delayed=${counts.delayed ?? 0}; debounce ${debounceSec}s)`
+      `[Comment Poll] Requeued ${enqueued} orphaned PENDING from DB (waiting=${counts.waiting ?? 0} active=${counts.active ?? 0} delayed=${counts.delayed ?? 0}; debounce ${debounceSec}s; accounts=${takenByAccount.size})`
     );
   }
   return enqueued;
