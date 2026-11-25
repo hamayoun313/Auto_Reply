@@ -185,12 +185,79 @@ export async function reconcileComments(): Promise<void> {
   await requeueOrphanedPendingComments();
 }
 
+const UNSENDABLE_PENDING_MESSAGE =
+  "Campaign inactive or has no post — stopped auto-retry";
+
+/**
+ * PENDING rows for inactive / post-less campaigns can never be sent, but used
+ * to sit forever (reconciler only loads isActive campaigns). Fail them without
+ * calling Meta so they stop inflating the dashboard.
+ */
+export async function failUnsendablePendingComments(): Promise<number> {
+  const inactive = await prisma.dmLog.updateMany({
+    where: {
+      status: "PENDING",
+      automation: { isActive: false },
+    },
+    data: {
+      status: "FAILED",
+      attempts: MAX_COMMENT_SEND_ATTEMPTS,
+      errorMessage: UNSENDABLE_PENDING_MESSAGE,
+      dmDeliveryUnconfirmed: false,
+    },
+  });
+
+  const noPostCandidates = await prisma.dmLog.findMany({
+    where: {
+      status: "PENDING",
+      automation: { isActive: true },
+    },
+    select: {
+      id: true,
+      automation: { select: { postId: true, postIds: true } },
+    },
+    take: 500,
+  });
+  const noPostIds = noPostCandidates
+    .filter((row) => {
+      const postId = row.automation.postId?.trim() ?? "";
+      const postIds = row.automation.postIds?.filter((id) => id?.trim()) ?? [];
+      return !postId && postIds.length === 0;
+    })
+    .map((row) => row.id);
+
+  let noPostCount = 0;
+  if (noPostIds.length > 0) {
+    const noPost = await prisma.dmLog.updateMany({
+      where: { id: { in: noPostIds }, status: "PENDING" },
+      data: {
+        status: "FAILED",
+        attempts: MAX_COMMENT_SEND_ATTEMPTS,
+        errorMessage: UNSENDABLE_PENDING_MESSAGE,
+        dmDeliveryUnconfirmed: false,
+      },
+    });
+    noPostCount = noPost.count;
+  }
+
+  const total = inactive.count + noPostCount;
+  if (total > 0) {
+    console.log(
+      `[Comment Poll] Failed ${total} unsendable PENDING (inactive=${inactive.count} no_post=${noPostCount})`
+    );
+  }
+  return total;
+}
+
 /**
  * Re-enqueue orphaned PENDING DmLogs without another Meta comment listing.
  * Caps each pass to COMMENT_POLL_MAX_PER_SWEEP and no-ops while jobs are
  * already waiting/active/delayed.
  */
 export async function requeueOrphanedPendingComments(): Promise<number> {
+  // Always safe — no Meta calls. Run even while the circuit is open.
+  await failUnsendablePendingComments();
+
   const circuit = await getAppRateLimitState();
   if (circuit.limited) {
     console.log(
@@ -281,7 +348,22 @@ export async function requeueOrphanedPendingComments(): Promise<number> {
       row.automation.postId?.trim() ||
       row.automation.postIds?.find((id) => id?.trim())?.trim() ||
       "";
-    if (!mediaId) continue;
+    if (!mediaId) {
+      await prisma.dmLog.updateMany({
+        where: {
+          commentId: row.commentId,
+          automationId: row.automation.id,
+          status: "PENDING",
+        },
+        data: {
+          status: "FAILED",
+          attempts: MAX_COMMENT_SEND_ATTEMPTS,
+          errorMessage: UNSENDABLE_PENDING_MESSAGE,
+          dmDeliveryUnconfirmed: false,
+        },
+      });
+      continue;
+    }
 
     const ig = row.automation.instagramAccount;
     const fb = row.automation.facebookPage;
