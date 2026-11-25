@@ -6,6 +6,7 @@ import {
   listFacebookPagesForToken,
   type DiscoverableFacebookPage,
 } from "@/lib/meta/facebook-pages";
+import { ShortLivedTokenError } from "@/lib/meta/token-lifetime";
 import { requireSettingsUnlock } from "@/lib/settings-access";
 import {
   canManageWorkspace,
@@ -154,8 +155,12 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     const message = error instanceof Error ? error.message : "Connection failed";
     console.error("[Facebook Token Connect]", message);
+    const shortLived = error instanceof ShortLivedTokenError;
     return NextResponse.json(
-      { error: "connection_failed", message },
+      {
+        error: shortLived ? "short_lived_token" : "connection_failed",
+        message,
+      },
       { status: 400 }
     );
   }

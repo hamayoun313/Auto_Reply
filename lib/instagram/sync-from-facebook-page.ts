@@ -59,7 +59,21 @@ export async function syncInstagramAccountFromFacebookPageDetailed(opts: {
 
   const username = (linked.username ?? opts.pageName).replace(/^@/, "");
   const encrypted = encryptToken(linked.pageAccessToken);
-  const tokenExpiresAt = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000);
+  // Prefer parent Page token lifetime; fall back only if debug_token fails.
+  let tokenExpiresAt = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000);
+  try {
+    const { resolveStoredTokenExpiry } = await import(
+      "@/lib/meta/token-lifetime"
+    );
+    tokenExpiresAt =
+      (await resolveStoredTokenExpiry(linked.pageAccessToken)) ??
+      tokenExpiresAt;
+  } catch (err) {
+    console.warn(
+      "[IG Sync] Could not resolve token lifetime; keeping 60d sentinel:",
+      err instanceof Error ? err.message : err
+    );
+  }
 
   const workspaceAccounts = await prisma.instagramAccount.findMany({
     where: { workspaceId: opts.workspaceId, provider: "META" },

@@ -3,6 +3,7 @@ import { canConnectFacebookPage } from "@/lib/facebook-pages";
 import { syncInstagramAccountFromFacebookPage } from "@/lib/instagram/sync-from-facebook-page";
 import { subscribeFacebookPageToWebhooks } from "@/lib/meta/facebook-pages";
 import { encryptToken } from "@/lib/meta/oauth";
+import { resolveStoredTokenExpiry } from "@/lib/meta/token-lifetime";
 
 export type SaveFacebookPageInput = {
   workspaceId: string;
@@ -54,7 +55,8 @@ export async function saveFacebookPageConnection(
   }
 
   const encryptedToken = encryptToken(input.page.accessToken);
-  const tokenExpiresAt = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000);
+  // Real Meta lifetime — never stamp a fake +60 days on short-lived tokens.
+  const tokenExpiresAt = await resolveStoredTokenExpiry(input.page.accessToken);
   const data = {
     name: input.page.name,
     accessToken: encryptedToken,

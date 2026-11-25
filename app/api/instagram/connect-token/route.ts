@@ -9,6 +9,10 @@ import {
 } from "@/lib/meta/client";
 import { encryptToken } from "@/lib/meta/oauth";
 import { mapInstagramIdsToPageTokens } from "@/lib/meta/page-token";
+import {
+  resolveStoredTokenExpiry,
+  ShortLivedTokenError,
+} from "@/lib/meta/token-lifetime";
 import { requireSettingsUnlock } from "@/lib/settings-access";
 import { canManageWorkspace, getCurrentWorkspaceContext } from "@/lib/workspace-access";
 
@@ -46,7 +50,7 @@ async function saveOneInstagramAccount(opts: {
   }
 
   const encryptedToken = encryptToken(opts.accessToken);
-  const tokenExpiresAt = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000);
+  const tokenExpiresAt = await resolveStoredTokenExpiry(opts.accessToken);
   const data = {
     username: opts.account.username ?? opts.account.id,
     name: opts.account.name ?? null,
@@ -229,6 +233,13 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     console.error("[Instagram Token Connect] Error:", error);
-    return NextResponse.json({ error: "connect_failed", message }, { status: 400 });
+    const shortLived = error instanceof ShortLivedTokenError;
+    return NextResponse.json(
+      {
+        error: shortLived ? "short_lived_token" : "connect_failed",
+        message,
+      },
+      { status: 400 }
+    );
   }
 }
